@@ -1,0 +1,39 @@
+# Copyright 2025 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+name: temporal-worker-go
+summary: Temporal worker app that uses golang
+description: OCI image for Temporal worker app that uses golang
+version: "1.0"
+base: ubuntu@24.04
+build-base: ubuntu@24.04
+license: Apache-2.0
+
+platforms:
+  amd64:
+
+services:
+  temporal-worker:
+    override: replace
+    summary: "Temporal golang worker"
+    startup: disabled
+    command: "/app/scripts/start-worker.sh"
+
+parts:
+  worker:
+    plugin: go
+    source: .
+    build-snaps:
+      - go/1.24/stable
+    organize:
+      bin/worker: bin/helloworld
+  scripts:
+    plugin: dump
+    source: .
+    organize:
+      scripts: app/scripts
+    stage:
+      - app
+    permissions:
+      - path: /app/scripts/start-worker.sh
+        mode: '755'

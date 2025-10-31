@@ -1,0 +1,53 @@
+# Copyright 2025 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+name: temporal-worker-python
+summary: Temporal worker app that uses python
+description: OCI image for Temporal worker app that uses python
+version: "1.0"
+base: ubuntu@24.04
+build-base: ubuntu@24.04
+license: Apache-2.0
+
+platforms:
+  amd64:
+
+services:
+  temporal-worker:
+    override: replace
+    summary: "Temporal python worker"
+    startup: disabled
+    command: "/app/scripts/start-worker.sh"
+    environment:
+      PYTHONPATH: /usr/lib/python3/
+
+parts:
+  worker-dependencies:
+    plugin: python
+    source: .
+    stage-packages:
+      - python3-venv
+    python-packages:
+      - temporal-lib-py>=1.8.0
+      - temporalio>=1.18.1
+  ca-certificates:
+    # This installs ca-certificates in the build env to populate our /etc/ssl/certs,
+    # then copies just the ca-certificates.crt to the final image
+    plugin: nil
+    build-packages: 
+      - ca-certificates
+    override-build: |-
+      mkdir -p $CRAFT_PART_INSTALL/etc/ssl/certs/
+      cp /etc/ssl/certs/ca-certificates.crt $CRAFT_PART_INSTALL/etc/ssl/certs/ca-certificates.crt
+  worker-source-code:
+    plugin: dump
+    source: .
+    source-type: local
+    organize:
+      scripts: app/scripts
+      src: app/src
+    stage:
+      - app
+    permissions:
+      - path: app/scripts/*.sh
+        mode: '755'

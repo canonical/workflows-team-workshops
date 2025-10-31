@@ -1,0 +1,122 @@
+set export # Just variables are exported to environment variables
+
+[private]
+default:
+	just --list
+
+[private]
+install-nginx-controller:
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	if [ "$(kubectl get ingressclass | grep nginx | wc -l)" = "1" ]; then
+		echo "nginx ingress controller already installed"
+		exit 0
+	fi
+
+	kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/refs/tags/controller-v1.13.3/deploy/static/provider/cloud/deploy.yaml
+
+	until [[ $(kubectl -n ingress-nginx get svc | grep -E 'ingress-nginx-controller\s' | awk '{print $4}') =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] ; do
+		echo "Waiting for ingress controller to be assigned an external ip"
+		sleep 5
+	done
+
+[private]
+stop-local-registry:
+	docker stop registry || true
+	docker rm registry || true
+
+[private]
+start-local-registry:
+	docker start registry || docker run -d -p 5000:5000 --name registry registry:2.7
+
+[private]
+push-to-local-registry rock_filepath registry tag: (start-local-registry)
+	rockcraft.skopeo --insecure-policy copy --dest-tls-verify=false \
+		"oci-archive:${rock_filepath}" \
+		"docker://localhost:5000/${registry}:${tag}"
+
+# Print commands to install dependencies
+print-install-dependencies-commands:
+	echo "sudo apt-get purge $(dpkg -l | grep -i docker | awk '{print $2}')"
+	echo "sudo apt-get purge containerd.io"
+	echo "sudo rm -r /run/containerd"
+
+	echo "sudo -E concierge prepare -p k8s --extra-snaps=terraform"
+
+	echo "sudo snap install docker"
+	echo "sudo snap start docker"
+
+# Set up environment to enable Temporal deployment
+set-up-environment:
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	sudo k8s set load-balancer.l2-mode=true load-balancer.cidrs=10.2.0.0/24
+	sudo k8s enable ingress load-balancer
+
+	sudo k8s kubectl config view --raw | tee ~/.kube/config > /dev/null
+
+	just install-nginx-controller
+
+# Build sample python and go worker images
+prepare-worker-images: (start-local-registry)
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	cd worker_python && rockcraft pack
+	just push-to-local-registry $(ls -d "$PWD"/* | grep "\.rock") worker-python dev
+
+	cd ../worker_go && rockcraft pack
+	just push-to-local-registry $(ls -d "$PWD"/* | grep "\.rock") worker-go dev
+
+# Initialize the terraform project
+init-terraform force="false":
+	#!/usr/bin/bash
+	cd terraform
+	if [[ "${force}" != "false" || ! -d ".terraform" ]]; then
+		terraform init
+	else
+		echo "terraform already initialized"
+	fi
+
+# Clean up, including removing existing juju models
+destroy:
+	#!/usr/bin/bash
+	cd terraform/
+	terraform destroy -auto-approve
+
+	juju destroy-model --force --destroy-storage --no-prompt temporal-server
+	juju destroy-model --force --destroy-storage --no-prompt temporal-worker
+	juju destroy-model --force --destroy-storage --no-prompt cos-lite
+
+# Format the Charmed Temporal solution + COS with terraform
+format:
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	cd terraform/
+	terraform fmt
+	tflint --chdir .
+
+# Plan the Charmed Temporal solution + COS with terraform
+plan-temporal-solution:
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	cd terraform/
+	terraform plan
+
+# Apply the Charmed Temporal solution + COS with terraform
+apply-temporal-solution skip_model_creation="false":
+	#!/usr/bin/bash
+	set -euxo pipefail
+
+	if [[ "${skip_model_creation}" == "false" ]]; then
+		juju add-model temporal-server
+		juju add-model temporal-worker
+		juju add-model cos-lite
+	fi
+
+	cd terraform/
+	TF_LOG_CORE=DEBUG terraform apply -auto-approve
