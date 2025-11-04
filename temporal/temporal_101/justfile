@@ -4,7 +4,6 @@ set export # Just variables are exported to environment variables
 default:
 	just --list
 
-[private]
 install-nginx-controller:
 	#!/usr/bin/bash
 	set -euxo pipefail
@@ -37,15 +36,22 @@ push-to-local-registry rock_filepath registry tag: (start-local-registry)
 		"docker://localhost:5000/${registry}:${tag}"
 
 # Print commands to install dependencies
-print-install-dependencies-commands:
-	echo "sudo apt-get purge $(dpkg -l | grep -i docker | awk '{print $2}')"
-	echo "sudo apt-get purge containerd.io"
-	echo "sudo rm -r /run/containerd"
+install-dependencies confirm="false":
+	#!/usr/bin/bash
 
-	echo "sudo -E concierge prepare -p k8s --extra-snaps=terraform"
+	if [[ "${confirm}" == "false" ]]; then
+		echo "Please run target with confirmation of dangerous actions"
+		exit 1;
+	fi
 
-	echo "sudo snap install docker"
-	echo "sudo snap start docker"
+	sudo apt-get purge $(dpkg -l | grep -i docker | awk '{print $2}')
+	sudo apt-get purge containerd.io
+	sudo rm -r /run/containerd
+
+	sudo -E concierge prepare -p k8s --extra-snaps=terraform,just
+
+	sudo snap install docker
+	sudo snap start docker
 
 # Set up environment to enable Temporal deployment
 set-up-environment:
@@ -83,12 +89,11 @@ init-terraform force="false":
 # Clean up, including removing existing juju models
 destroy:
 	#!/usr/bin/bash
-	cd terraform/
-	terraform destroy -auto-approve
-
 	juju destroy-model --force --destroy-storage --no-prompt temporal-server
 	juju destroy-model --force --destroy-storage --no-prompt temporal-worker
 	juju destroy-model --force --destroy-storage --no-prompt cos-lite
+
+	rm -f terraform/terraform.tfstate*
 
 # Format the Charmed Temporal solution + COS with terraform
 format:
@@ -107,16 +112,48 @@ plan-temporal-solution:
 	cd terraform/
 	terraform plan
 
+# Build worker images and push them to local registry
+build-and-push-images:
+	#!/usr/bin/bash
+	set -x
+
+	cd worker_python && rockcraft pack
+
+	cd ../worker_go && rockcraft pack
+
+	cd ..
+
+	worker_python_rock_filepath=$(ls -d "$PWD"/worker_python/* | grep "\.rock")
+	worker_go_rock_filepath=$(ls -d "$PWD"/worker_go/* | grep "\.rock")
+
+	just stop-local-registry
+	just push-to-local-registry ${worker_python_rock_filepath} worker-python dev
+	just push-to-local-registry ${worker_go_rock_filepath} worker-go dev
+
 # Apply the Charmed Temporal solution + COS with terraform
-apply-temporal-solution skip_model_creation="false":
+apply-temporal-solution:
 	#!/usr/bin/bash
 	set -euxo pipefail
 
-	if [[ "${skip_model_creation}" == "false" ]]; then
-		juju add-model temporal-server
-		juju add-model temporal-worker
-		juju add-model cos-lite
-	fi
+	controller=$(echo "k8s")
+	
+	juju switch ${controller}
 
 	cd terraform/
-	TF_LOG_CORE=DEBUG terraform apply -auto-approve
+
+	rm -f inputs.tfvars
+
+	controller_addresses=$(juju show-controller --format json | jq -r ".\"${controller}\".details.\"api-endpoints\"[0]")
+	password=$(juju show-controller --format json --show-password | jq -r ".\"${controller}\".account.password")
+	juju show-controller --format json | jq -r ".\"${controller}\".details.\"ca-cert\"" > ./ca-cert.pem
+
+	echo "controller_addresses = \"${controller_addresses}\"" > inputs.tfvars
+	echo "password = \"${password}\"" >> inputs.tfvars
+
+	terraform apply -auto-approve -var-file=inputs.tfvars
+
+update-worker-image-resources:
+	#!/usr/bin/bash
+	juju refresh --model temporal-worker worker-go --resource temporal-worker-image="localhost:5000/worker-go:dev"
+
+	juju refresh --model temporal-worker worker-python --resource temporal-worker-image="localhost:5000/worker-python:dev"

@@ -15,3 +15,13 @@ variable "cos_model" {
   type        = string
   default     = "cos-lite"
 }
+
+variable "controller_addresses" {
+  description = "Address of the controller for the k8s cloud"
+  type        = string
+}
+
+variable "password" {
+  description = "Password of controller for the k8s cloud"
+  type        = string
+}

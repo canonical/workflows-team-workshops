@@ -1,0 +1,147 @@
+set export # Just variables are exported to environment variables
+
+[private]
+default:
+    just --list
+
+[private]
+deploy-temporal-server temporal_channel="1.23/edge" postgresql_channel="14/stable" nginx_ingress_integrator_channel="latest/stable" self_signed_certificates_channel="1/stable":
+    #!/usr/bin/bash
+    juju switch temporal-server
+
+    juju deploy postgresql-k8s --channel "${postgresql_channel}" --trust
+
+    juju deploy temporal-k8s --channel "${temporal_channel}" \
+        --config num-history-shards=1 \
+        --config auth-enabled=false
+    juju deploy temporal-admin-k8s --channel "${temporal_channel}"
+    juju deploy temporal-ui-k8s --channel "${temporal_channel}" \
+        --config tls-secret-name=""
+
+    juju deploy nginx-ingress-integrator temporal-ui-ingress \
+        --channel "${nginx_ingress_integrator_channel}" --trust \
+        --config ingress-class=nginx \
+        --config backend-protocol=HTTP \
+        --config service-hostname=temporal-ui-k8s
+
+    juju deploy self-signed-certificates --channel "${self_signed_certificates_channel}"
+
+[private]
+deploy-cos cos_channel="latest/stable":
+    juju deploy --model cos-lite cos-lite --channel="${cos_channel}" --trust
+
+    juju offer cos-lite.grafana:grafana-dashboard
+    juju offer cos-lite.loki:logging
+    juju offer cos-lite.prometheus:metrics-endpoint
+    # TODO: add tracing
+
+# TODO: change 1.0/edge -> 1.0/stable
+[private]
+deploy-workers worker_python_image worker_go_image worker_channel="1.0/edge":
+    #!/usr/bin/bash
+    juju switch temporal-worker
+
+    juju deploy temporal-worker-k8s temporal-worker-k8s-python \
+        --channel ${worker_channel} \
+        --resource temporal-worker-image=${worker_python_image} \
+        --config host=temporal-k8s.temporal-server:7233 \
+        --config queue=worker-python-queue \
+        --config namespace=worker-python-namespace
+    juju deploy temporal-worker-k8s temporal-worker-k8s-go \
+        --channel ${worker_channel} \
+        --resource temporal-worker-image=${worker_go_image} \
+        --config host=temporal-k8s.temporal-server:7233 \
+        --config queue=worker-go-queue \
+        --config namespace=worker-go-namespace
+
+[private]
+integrate-applications:
+    #!/usr/bin/bash
+
+    juju switch temporal-server
+
+    # Integrate charms within temporal-server model
+    juju integrate temporal-k8s:db postgresql-k8s:database
+    juju integrate temporal-k8s:visibility postgresql-k8s:database
+
+    juju integrate temporal-k8s:admin temporal-admin-k8s:admin
+
+    juju integrate temporal-k8s:ui temporal-ui-k8s:ui
+
+    juju integrate temporal-ui-ingress:certificates self-signed-certificates:certificates
+
+    juju integrate temporal-ui-k8s:nginx-route temporal-ui-ingress:nginx-route
+
+    # Consume cos-lite offers in temporal-server model
+    juju consume admin/cos-lite.grafana
+    juju consume admin/cos-lite.loki
+    juju consume admin/cos-lite.prometheus
+
+    # Integrate Temporal charms with COS
+    juju integrate temporal-k8s:grafana-dashboard grafana
+    juju integrate temporal-k8s:logging loki
+    juju integrate temporal-k8s:metrics-endpoint prometheus
+
+    juju switch temporal-worker
+
+    # Consume cos-lite offers in temporal-worker model
+    juju consume admin/cos-lite.grafana
+    juju consume admin/cos-lite.loki
+    juju consume admin/cos-lite.prometheus
+
+    # Integrate Temporal python worker charm with COS
+    juju integrate temporal-worker-k8s-python:metrics-endpoint prometheus
+    juju integrate temporal-worker-k8s-python:logging loki
+    juju integrate temporal-worker-k8s-python:grafana-dashboard grafana
+
+[private]
+create-namespaces:
+    #!/usr/bin/bash
+    juju switch "temporal-server"
+
+    juju wait-for application temporal-admin-k8s --query='name == "temporal-admin-k8s" && status == "active"'
+
+    juju run temporal-admin-k8s/0 cli args="operator namespace create --namespace worker-go-namespace --retention 3d" --wait 1m
+    juju run temporal-admin-k8s/0 cli args="operator namespace create --namespace worker-python-namespace --retention 3d" --wait 1m
+
+# Pack the python worker image
+pack-worker-python debug="":
+    #!/usr/bin/bash
+    set -x
+
+    debug_options=$(if [ -n "${debug}" ]; then echo "--debug"; fi)
+    cd worker_python && rockcraft pack ${debug_options}
+
+pack-worker-go debug="":
+    #!/usr/bin/bash
+    set -x
+
+    debug_options=$(if [ -n "{debug}" ]; then echo "--debug"; fi)
+    cd worker_go && rockcraft pack ${debug_options}
+
+# Deploy the Temporal applications
+deploy-temporal:
+    #!/usr/bin/bash
+    set -euxo pipefail
+
+    just pack-worker-python
+    worker_python_rock_filepath=$(ls -d "$PWD"/worker_python/* | grep "\.rock")
+
+    just pack-worker-go
+    worker_go_rock_filepath=$(ls -d "$PWD"/worker_go/* | grep "\.rock")
+
+    just --justfile ./justfile stop-local-registry
+    just --justfile ./justfile push-to-local-registry ${worker_python_rock_filepath} worker-python dev
+    just --justfile ./justfile push-to-local-registry ${worker_go_rock_filepath} worker-go dev
+
+    juju add-model temporal-server
+    juju add-model temporal-worker
+    juju add-model cos-lite
+
+    just deploy-temporal-server
+    just deploy-cos
+    just deploy-workers localhost:5000/worker-python:dev localhost:5000/worker-go:dev
+
+    just integrate-applications
+
+    just create-namespaces

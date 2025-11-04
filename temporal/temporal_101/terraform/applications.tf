@@ -13,22 +13,26 @@ locals {
       "namespace" : "worker-go-namespace"
     }
   ]
+
+  worker_grafana_agent_k8s_name = "grafana-agent-k8s"
+}
+
+provider "juju" {
+  controller_addresses = var.controller_addresses
+  username = "admin"
+  password = var.password
+  ca_certificate = file("./ca-cert.pem")
 }
 
 resource "juju_model" "temporal_server_model" {
   name = var.server_model
 
   cloud {
-    name   = "k8s"
-    region = "localhost"
+    name = "k8s"
   }
 
-  credential = ""
   config = {
-    logging-config              = "<root>=INFO"
-    development                 = true
-    no-proxy                    = "jujucharms.com"
-    update-status-hook-interval = "5m"
+    automatically-retry-hooks = true
   }
 }
 
@@ -36,16 +40,11 @@ resource "juju_model" "temporal_worker_model" {
   name = var.worker_model
 
   cloud {
-    name   = "k8s"
-    region = "localhost"
+    name = "k8s"
   }
 
-  credential = ""
   config = {
-    logging-config              = "<root>=INFO"
-    development                 = true
-    no-proxy                    = "jujucharms.com"
-    update-status-hook-interval = "5m"
+    automatically-retry-hooks = true
   }
 }
 
@@ -53,23 +52,18 @@ resource "juju_model" "cos_model" {
   name = var.cos_model
 
   cloud {
-    name   = "k8s"
-    region = "localhost"
+    name = "k8s"
   }
 
-  credential = ""
   config = {
-    logging-config              = "<root>=INFO"
-    development                 = true
-    no-proxy                    = "jujucharms.com"
-    update-status-hook-interval = "5m"
+    automatically-retry-hooks = true
   }
 }
 
 module "charmed-temporal" {
   # tflint-ignore: terraform_module_pinned_source
-  source            = "git::https://github.com/canonical/charmed-temporal-solutions//modules/charmed-temporal?ref=track/1.23"
-  model             = juju_model.temporal_server_model.name
+  source            = "git::https://github.com/canonical/charmed-temporal-solutions//modules/charmed-temporal?ref=fix/expose_grafana_agent"
+  model_uuid             = juju_model.temporal_server_model.id
   cos_configuration = true
 }
 
@@ -79,8 +73,9 @@ module "temporal-worker" {
   }
 
   # tflint-ignore: terraform_module_pinned_source
-  source = "git::https://github.com/canonical/temporal-worker-k8s-operator//terraform?ref=track/1.0"
-  model  = juju_model.temporal_worker_model.name
+  source = "git::https://github.com/canonical/temporal-worker-k8s-operator//terraform?ref=fix/switch_model"
+  model_uuid  = juju_model.temporal_worker_model.id
+  app_name = each.value.name
   image = {
     "image" : each.value.image
   }
@@ -92,49 +87,21 @@ module "temporal-worker" {
   }
 }
 
+resource "juju_application" "worker_grafana_agent_k8s" {
+  name  = local.worker_grafana_agent_k8s_name
+  model_uuid = juju_model.temporal_worker_model.id
+  charm {
+    name    = "grafana-agent-k8s"
+    channel = "1/stable"
+  }
+  trust  = true
+  units  = 1
+}
+
 module "cos-lite" {
   # tflint-ignore: terraform_module_pinned_source
-  source       = "git::https://github.com/canonical/observability-stack//terraform/cos-lite?ref=tf-provider-v0"
-  model        = juju_model.cos_model.name
+  source       = "git::https://github.com/canonical/observability-stack//terraform/cos-lite?ref=main"
+  model_uuid        = juju_model.cos_model.id
   channel      = "1/stable"
   internal_tls = false
-}
-
-resource "juju_integration" "grafana-agent-to-cos-grafana" {
-  model = juju_model.temporal_server_model.name
-
-  application {
-    name     = module.charmed-temporal.grafana_agent_k8s.app_name
-    endpoint = "grafana-dashboards-provider"
-  }
-  application {
-    name     = "grafana"
-    endpoint = one(module.cos-lite.offers.grafana_dashboards.endpoints)
-  }
-}
-
-resource "juju_integration" "grafana-agent-to-cos-loki" {
-  model = juju_model.temporal_server_model.name
-
-  application {
-    name     = module.charmed-temporal.grafana_agent_k8s.app_name
-    endpoint = "logging-provider"
-  }
-  application {
-    name     = "grafana"
-    endpoint = one(module.cos-lite.offers.loki_logging.endpoints)
-  }
-}
-
-resource "juju_integration" "grafana-agent-to-cos-prometheus" {
-  model = juju_model.temporal_server_model.name
-
-  application {
-    name     = "prometheus"
-    endpoint = one(module.cos-lite.offers.prometheus_receive_remote_write.endpoints)
-  }
-  application {
-    name     = module.charmed-temporal.grafana_agent_k8s.app_name
-    endpoint = "metrics-endpoint"
-  }
 }
