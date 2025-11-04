@@ -157,3 +157,17 @@ update-worker-image-resources:
 	juju refresh --model temporal-worker worker-go --resource temporal-worker-image="localhost:5000/worker-go:dev"
 
 	juju refresh --model temporal-worker worker-python --resource temporal-worker-image="localhost:5000/worker-python:dev"
+
+configure-ingress:
+	#!/usr/bin/bash
+	juju switch temporal-server
+
+	juju deploy nginx-ingress-integrator temporal-ui-ingress \
+        --channel "latest/stable" --trust \
+        --config ingress-class=nginx \
+        --config backend-protocol=HTTP \
+        --config service-hostname=temporal-ui-k8s
+
+    juju integrate temporal-ui-ingress:certificates self-signed-certificates:certificates
+
+    juju integrate temporal-ui-k8s:nginx-route temporal-ui-ingress:nginx-route
