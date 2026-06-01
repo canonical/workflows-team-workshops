@@ -34,7 +34,7 @@ HEAVY = k8s.V1ResourceRequirements(
 )
 
 # ---------------------------------------------------------------------------
-# Task 1: Ingest — generate 50K sales records, upload to MinIO
+# Task 1: Ingest — generate 50K sales records, upload to MicroCeph S3
 # ---------------------------------------------------------------------------
 INGEST_SCRIPT = r'''
 python3 << 'PYSCRIPT'
@@ -78,12 +78,12 @@ w.writerow(["order_id","date","category","region","channel","quantity","unit_pri
 w.writerows(rows)
 body = buf.getvalue().encode()
 
-ENDPOINT = "minio.airflow-spark.svc.cluster.local"
-PORT = 9000
+ENDPOINT = "10.0.0.78"
+PORT = 80
 BUCKET = "airflow-spark"
 KEY = "demo/sales_50k.csv"
-ACCESS = "minioadmin"
-SECRET = "minioadmin123"
+ACCESS = "airflow-access-key"
+SECRET = "airflow-secret-key"
 
 date_str = formatdate(usegmt=True)
 sts = "PUT" + "\n" + "\n" + "text/csv" + "\n" + date_str + "\n" + "/" + BUCKET + "/" + KEY
@@ -121,9 +121,9 @@ print("=" * 72)
 
 spark = (SparkSession.builder
     .appName("CategoryAnalysis")
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio.airflow-spark.svc.cluster.local:9000")
-    .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
-    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123")
+    .config("spark.hadoop.fs.s3a.endpoint", "http://10.0.0.78:80")
+    .config("spark.hadoop.fs.s3a.access.key", "airflow-access-key")
+    .config("spark.hadoop.fs.s3a.secret.key", "airflow-secret-key")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
@@ -182,9 +182,9 @@ print("=" * 72)
 
 spark = (SparkSession.builder
     .appName("RegionalAnalysis")
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio.airflow-spark.svc.cluster.local:9000")
-    .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
-    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123")
+    .config("spark.hadoop.fs.s3a.endpoint", "http://10.0.0.78:80")
+    .config("spark.hadoop.fs.s3a.access.key", "airflow-access-key")
+    .config("spark.hadoop.fs.s3a.secret.key", "airflow-secret-key")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
@@ -242,9 +242,9 @@ print("=" * 72)
 
 spark = (SparkSession.builder
     .appName("TrendAnalysis")
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio.airflow-spark.svc.cluster.local:9000")
-    .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
-    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123")
+    .config("spark.hadoop.fs.s3a.endpoint", "http://10.0.0.78:80")
+    .config("spark.hadoop.fs.s3a.access.key", "airflow-access-key")
+    .config("spark.hadoop.fs.s3a.secret.key", "airflow-secret-key")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
@@ -315,9 +315,9 @@ from pyspark.sql import functions as F
 
 spark = (SparkSession.builder
     .appName("ExecutiveSummary")
-    .config("spark.hadoop.fs.s3a.endpoint", "http://minio.airflow-spark.svc.cluster.local:9000")
-    .config("spark.hadoop.fs.s3a.access.key", "minioadmin")
-    .config("spark.hadoop.fs.s3a.secret.key", "minioadmin123")
+    .config("spark.hadoop.fs.s3a.endpoint", "http://10.0.0.78:80")
+    .config("spark.hadoop.fs.s3a.access.key", "airflow-access-key")
+    .config("spark.hadoop.fs.s3a.secret.key", "airflow-secret-key")
     .config("spark.hadoop.fs.s3a.path.style.access", "true")
     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
     .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
@@ -351,7 +351,7 @@ print("|  Best Month   : %-20s ($%s)" % (best_month["month_name"], "{:,.0f}".for
 print("+" + "-" * 70 + "+")
 print("|" + "".center(70) + "|")
 print("|  Pipeline: 5 tasks, 3 parallel Spark jobs, 50K records processed" + " " * 3 + "|")
-print("|  Infrastructure: Charmed Airflow + Spark + MinIO on Juju/K8s" + " " * 9 + "|")
+print("|  Infrastructure: Charmed Airflow + Spark + MicroCeph on Juju/K8s" + " " * 5 + "|")
 print("|" + "".center(70) + "|")
 print("+" + "=" * 70 + "+")
 print()

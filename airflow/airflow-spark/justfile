@@ -1,8 +1,8 @@
-# Charmed Airflow + Spark Demo Deployment
+# Charmed Airflow + Spark Demo Deployment (MicroCeph S3 backend)
 #
 # Usage:
 #   just deploy          # Full deployment from scratch
-#   just upload-dag      # Upload DAG to MinIO
+#   just upload-dag      # Upload DAG to MicroCeph S3
 #   just trigger         # Trigger the parallel demo DAG
 #   just watch           # Watch pods spawning in real-time
 #   just status          # Check task states
@@ -13,20 +13,26 @@
 #   - juju bootstrap'd controller (concierge-k8s or similar)
 #   - kubectl configured
 #   - just (https://github.com/casey/just)
+#   - MicroCeph installed with RGW enabled (sudo snap install microceph)
+#   - s3cmd installed (pip install s3cmd)
 
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
 
 MODEL := "airflow-spark"
-MINIO_ACCESS := "minioadmin"
-MINIO_SECRET := "minioadmin123"
-MINIO_BUCKET := "airflow-spark"
+S3_ACCESS := "airflow-access-key"
+S3_SECRET := "airflow-secret-key"
+S3_BUCKET := "airflow-spark"
+# RGW endpoint: host IP reachable from K8s pods
+S3_HOST := "10.0.0.78"
+S3_PORT := "80"
+S3_ENDPOINT := "http://" + S3_HOST + ":" + S3_PORT
 
 # ============================================================================
 # MAIN RECIPES
 # ============================================================================
 
-# Full deployment: model + charms + minio + spark RBAC + DAG upload
-deploy: create-model deploy-charms deploy-minio configure-spark wait-for-pods configure-fernet configure-executor patch-coordinator patch-executor add-relations wait-ready patch-s3-worker upload-dag
+# Full deployment: model + charms + S3 bucket + spark RBAC + DAG upload
+deploy: create-model deploy-charms setup-s3 configure-spark wait-for-pods configure-fernet configure-executor patch-coordinator patch-executor add-relations wait-ready patch-s3-worker upload-dag
     @echo ""
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE"
@@ -94,17 +100,13 @@ deploy-charms:
     juju deploy spark-integration-hub-k8s --channel 3/stable --trust --force
     juju deploy spark-history-server-k8s --channel 3/stable --trust --force
 
-# Deploy MinIO (lightweight S3-compatible storage)
-deploy-minio:
-    @echo ">>> Deploying MinIO..."
-    sed -e 's/__MINIO_ACCESS__/{{MINIO_ACCESS}}/g' -e 's/__MINIO_SECRET__/{{MINIO_SECRET}}/g' minio-manifest.yaml | kubectl apply -n {{MODEL}} -f -
-    @echo ">>> Waiting for MinIO to be ready..."
-    kubectl wait --for=condition=available deploy/minio -n {{MODEL}} --timeout=120s
-    @echo ">>> Creating bucket..."
-    sleep 5
-    kubectl exec deploy/minio -n {{MODEL}} -- mc alias set local http://localhost:9000 {{MINIO_ACCESS}} {{MINIO_SECRET}}
-    kubectl exec deploy/minio -n {{MODEL}} -- mc mb local/{{MINIO_BUCKET}} --ignore-existing
-    kubectl exec deploy/minio -n {{MODEL}} -- mc anonymous set download local/{{MINIO_BUCKET}}
+# Create S3 bucket on MicroCeph RGW (runs on host, accessible from K8s at S3_ENDPOINT)
+setup-s3:
+    @echo ">>> Setting up S3 bucket on MicroCeph RGW..."
+    s3cmd --host={{S3_HOST}}:{{S3_PORT}} --host-bucket= --no-ssl \
+      --access_key={{S3_ACCESS}} --secret_key={{S3_SECRET}} \
+      mb s3://{{S3_BUCKET}} 2>/dev/null || true
+    @echo ">>> S3 bucket '{{S3_BUCKET}}' ready at {{S3_ENDPOINT}}"
 
 # Configure all Juju relations and S3 (standalone entry point)
 configure-relations: wait-for-pods configure-fernet configure-executor add-relations
@@ -128,21 +130,21 @@ wait-for-pods:
     # Extra wait to ensure Pebble is fully initialized inside containers
     sleep 15
 
-# Configure S3 integrator with MinIO credentials
+# Configure S3 integrator with MicroCeph RGW credentials
 configure-s3:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Configuring S3 integrator..."
     juju config s3-integrator \
-      endpoint="http://minio.{{MODEL}}.svc.cluster.local:9000" \
-      bucket="{{MINIO_BUCKET}}" \
+      endpoint="{{S3_ENDPOINT}}" \
+      bucket="{{S3_BUCKET}}" \
       path="spark-events" \
       region="us-east-1"
     echo ">>> Waiting for s3-integrator to be ready..."
     juju wait-for unit s3-integrator/0 --query='agent-status=="idle"' --timeout=5m
     juju run s3-integrator/0 sync-s3-credentials \
-      access-key="{{MINIO_ACCESS}}" \
-      secret-key="{{MINIO_SECRET}}"
+      access-key="{{S3_ACCESS}}" \
+      secret-key="{{S3_SECRET}}"
     echo ">>> S3 configured!"
 
 # Generate and configure fernet key secret
@@ -163,14 +165,14 @@ add-relations:
 
     echo ">>> Configuring S3 integrator..."
     juju config s3-integrator \
-      endpoint="http://minio.{{MODEL}}.svc.cluster.local:9000" \
-      bucket="{{MINIO_BUCKET}}" \
+      endpoint="{{S3_ENDPOINT}}" \
+      bucket="{{S3_BUCKET}}" \
       path="spark-events" \
       region="us-east-1"
     juju wait-for unit s3-integrator/0 --query='agent-status=="idle"' --timeout=5m
     juju run s3-integrator/0 sync-s3-credentials \
-      access-key="{{MINIO_ACCESS}}" \
-      secret-key="{{MINIO_SECRET}}"
+      access-key="{{S3_ACCESS}}" \
+      secret-key="{{S3_SECRET}}"
     echo ">>> S3 configured!"
 
     echo ">>> Adding database relation first..."
@@ -250,7 +252,7 @@ patch-s3-worker:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Injecting S3 connection env var into worker pod template..."
-    S3_CONN_URI="aws://{{MINIO_ACCESS}}:{{MINIO_SECRET}}@/?region_name=us-east-1&endpoint_url=http%3A%2F%2Fminio.{{MODEL}}.svc.cluster.local%3A9000"
+    S3_CONN_URI="aws://{{S3_ACCESS}}:{{S3_SECRET}}@/?region_name=us-east-1&endpoint_url=http%3A%2F%2F{{S3_HOST}}%3A{{S3_PORT}}"
     # Extract the S3 connection ID from the rendered airflow.cfg (retry up to 20 times)
     CONN_ID=""
     for i in $(seq 1 20); do
@@ -278,17 +280,18 @@ patch-s3-worker:
     sleep 15
     echo ">>> Worker pod template patched with S3 connection!"
 
-# Upload DAG to MinIO
+# Upload DAG to MicroCeph S3
 upload-dag:
-    @echo ">>> Uploading DAG to MinIO..."
-    cat dag_parallel_demo.py | kubectl exec -i deploy/minio -n {{MODEL}} -- \
-      bash -c 'cat > /tmp/dag.py && mc cp /tmp/dag.py local/{{MINIO_BUCKET}}/spark-events/dag_parallel_demo.py'
+    @echo ">>> Uploading DAG to MicroCeph S3..."
+    s3cmd --host={{S3_HOST}}:{{S3_PORT}} --host-bucket= --no-ssl \
+      --access_key={{S3_ACCESS}} --secret_key={{S3_SECRET}} \
+      put dag_parallel_demo.py s3://{{S3_BUCKET}}/spark-events/dag_parallel_demo.py
     @echo ">>> DAG uploaded. Waiting for DAG processor to detect it..."
     sleep 10
     @echo ">>> Restarting DAG processor to force bundle resync..."
     kubectl exec airflow-dag-processor-k8s-0 -c airflow-dag-processor -n {{MODEL}} -- \
       bash -c 'kill $$(pgrep -f "airflow dag-processor" | head -1)' 2>/dev/null || true
-    sleep 20
+    sleep 30
     @echo ">>> Reserializing DAGs..."
     kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
       airflow dags reserialize 2>/dev/null || true
