@@ -1,448 +1,154 @@
-# Charmed Airflow + Spark Demo Deployment (MicroCeph S3 backend)
+# Charmed Airflow + Spark Workshop
+#
+# Deploys the full Charmed Airflow 3.x stack using the charmed-airflow-solutions
+# Terraform module with:
+#   - KubernetesExecutor  (ephemeral worker pods per task)
+#   - git-integrator      (DAG sync from this repo's dags/ folder)
+#   - Spark Integration Hub (auto-creates Spark SA + RBAC + config Secret)
+#
+# SPARK_NAMESPACE and SPARK_USERNAME are injected natively into worker pods by
+# the executor charm via the coordinator ↔ Spark Hub relation.
+# DAG code reads them with os.environ.get("SPARK_NAMESPACE") / SPARK_USERNAME.
+#
+# Prerequisites: juju bootstrapped, kubectl, terraform, just, python3 + cryptography
 #
 # Usage:
-#   just deploy          # Full deployment from scratch
-#   just upload-dag      # Upload DAG to MicroCeph S3
-#   just trigger         # Trigger the parallel demo DAG
-#   just watch           # Watch pods spawning in real-time
-#   just status          # Check task states
-#   just logs            # View task output
-#   just teardown        # Destroy everything
-#
-# Prerequisites:
-#   - juju bootstrap'd controller (concierge-k8s or similar)
-#   - kubectl configured
-#   - just (https://github.com/casey/just)
-#   - MicroCeph installed with RGW enabled (sudo snap install microceph)
-#   - s3cmd installed (pip install s3cmd)
+#   just deploy     # Full deployment from scratch (~15 min)
+#   just trigger    # Trigger the spark_demo DAG
+#   just watch      # Watch pods spawning
+#   just teardown   # Destroy everything
 
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
 
 MODEL := "airflow-spark"
-S3_ACCESS := "airflow-access-key"
-S3_SECRET := "airflow-secret-key"
-S3_BUCKET := "airflow-spark"
-# RGW endpoint: host IP reachable from K8s pods
-S3_HOST := "10.0.0.78"
-S3_PORT := "80"
-S3_ENDPOINT := "http://" + S3_HOST + ":" + S3_PORT
+
+# Default: list all recipes
+default:
+    @just --list
+
+# Full deployment from scratch
+deploy: create-model configure-fernet terraform-apply wait-ready fix-spark-rbac
+    @echo "======================================================================"
+    @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
+    @echo "  DAG bundles sync from: https://github.com/canonical/workflows-team-workshops"
+    @echo "    → airflow/airflow-spark/dags/"
+    @echo "  just trigger  |  just watch  |  just get-ui-ip  |  just teardown"
+    @echo "======================================================================"
 
 # ============================================================================
-# MAIN RECIPES
+# DEPLOYMENT
 # ============================================================================
 
-# Full deployment: model + charms + S3 bucket + spark RBAC + DAG upload
-deploy: create-model deploy-charms setup-s3 configure-spark wait-for-pods configure-fernet configure-executor patch-coordinator patch-executor add-relations wait-ready patch-s3-worker upload-dag
-    @echo ""
-    @echo "======================================================================"
-    @echo "  DEPLOYMENT COMPLETE"
-    @echo "======================================================================"
-    @echo "  Model        : {{MODEL}}"
-    @echo "  DAG          : parallel_spark_analytics"
-    @echo ""
-    @echo "  Next steps:"
-    @echo "    just get-ui-ip     # Get the Airflow UI address"
-    @echo "    just trigger       # Trigger the DAG"
-    @echo "    just watch         # Watch pods spawning"
-    @echo "======================================================================"
-
-# Create the Juju model
+# Create the Juju model, waiting for any prior one to finish destroying
 create-model:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Creating model {{MODEL}}..."
-    # First wait for any prior model destruction to fully complete
     for i in $(seq 1 60); do
         STATUS=$(juju models 2>&1 | grep "{{MODEL}}" | awk '{print $NF}' || true)
-        if [[ "$STATUS" == "destroying" || "$STATUS" == "dying" ]]; then
-            echo "    Old model still destroying (attempt $i/60)..."
-            # After 30 attempts (5 min), force-clean the namespace
-            if [[ "$i" -eq 30 ]]; then
-                echo "    Force-cleaning stuck namespace..."
-                kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
-            fi
-            sleep 10
-            continue
-        fi
-        break
-    done
-    # Now add the model
-    for i in $(seq 1 10); do
-        if juju add-model {{MODEL}} 2>/dev/null; then
-            break
-        fi
-        echo "    Waiting for model creation (attempt $i/10)..."
+        [[ "$STATUS" == "destroying" || "$STATUS" == "dying" ]] || break
+        echo "    Old model still destroying ($i/60)..."
+        [[ "$i" -eq 30 ]] && kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
         sleep 10
     done
+    juju add-model {{MODEL}}
     juju switch {{MODEL}}
-    # Verify model is actually available (not dying)
-    for i in $(seq 1 10); do
-        STATUS=$(juju models 2>&1 | grep "{{MODEL}}" | grep -v "controller" | awk '{for(j=1;j<=NF;j++) if($j=="available"||$j=="destroying"||$j=="dying") print $j}' || true)
-        if [[ "$STATUS" == "available" ]]; then
-            echo "    Model is available!"
-            break
-        fi
-        echo "    Model status: $STATUS - waiting (attempt $i/10)..."
-        sleep 5
-    done
 
-# Deploy all charms
-deploy-charms:
-    @echo ">>> Deploying Airflow charms..."
-    juju deploy airflow-coordinator-k8s --channel 3.1/edge --trust
-    juju deploy airflow-api-server-k8s --channel 3.1/edge --trust
-    juju deploy airflow-scheduler-k8s --channel 3.1/edge --trust
-    juju deploy airflow-dag-processor-k8s --channel 3.1/edge --trust
-    juju deploy airflow-triggerer-k8s --channel 3.1/edge --trust
-    juju deploy airflow-kubernetes-executor-k8s --channel 3.1/edge --trust
-    juju deploy postgresql-k8s --channel 14/stable --trust
-    juju deploy s3-integrator --channel 1/stable
-    juju deploy spark-integration-hub-k8s --channel 3/stable --trust --force
-    juju deploy spark-history-server-k8s --channel 3/stable --trust --force
-
-# Create S3 bucket on MicroCeph RGW (runs on host, accessible from K8s at S3_ENDPOINT)
-setup-s3:
-    @echo ">>> Setting up S3 bucket on MicroCeph RGW..."
-    s3cmd --host={{S3_HOST}}:{{S3_PORT}} --host-bucket= --no-ssl \
-      --access_key={{S3_ACCESS}} --secret_key={{S3_SECRET}} \
-      mb s3://{{S3_BUCKET}} 2>/dev/null || true
-    @echo ">>> S3 bucket '{{S3_BUCKET}}' ready at {{S3_ENDPOINT}}"
-
-# Configure all Juju relations and S3 (standalone entry point)
-configure-relations: wait-for-pods configure-fernet configure-executor add-relations
-    @echo ">>> All relations and config done!"
-
-# Wait for all charm workload containers (Pebble) to be ready
-wait-for-pods:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Waiting for all charm pods to have ready containers..."
-    for pod in airflow-coordinator-k8s-0 airflow-api-server-k8s-0 airflow-scheduler-k8s-0 \
-               airflow-dag-processor-k8s-0 airflow-triggerer-k8s-0 postgresql-k8s-0; do
-        echo "    Waiting for $pod to exist..."
-        until kubectl get pod "$pod" -n {{MODEL}} &>/dev/null; do
-            sleep 5
-        done
-        echo "    Waiting for $pod to be ready..."
-        kubectl wait --for=condition=Ready pod/"$pod" -n {{MODEL}} --timeout=10m
-    done
-    echo ">>> All pods ready!"
-    # Extra wait to ensure Pebble is fully initialized inside containers
-    sleep 15
-
-# Configure S3 integrator with MicroCeph RGW credentials
-configure-s3:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Configuring S3 integrator..."
-    juju config s3-integrator \
-      endpoint="{{S3_ENDPOINT}}" \
-      bucket="{{S3_BUCKET}}" \
-      path="spark-events" \
-      region="us-east-1"
-    echo ">>> Waiting for s3-integrator to be ready..."
-    juju wait-for unit s3-integrator/0 --query='agent-status=="idle"' --timeout=5m
-    juju run s3-integrator/0 sync-s3-credentials \
-      access-key="{{S3_ACCESS}}" \
-      secret-key="{{S3_SECRET}}"
-    echo ">>> S3 configured!"
-
-# Generate and configure fernet key secret
+# Generate a fernet key, store as a Juju secret, and export its URI
 configure-fernet:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Configuring fernet key..."
     FERNET_VAL=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
     SECRET_URI=$(juju add-secret fernet-key fernet-key="$FERNET_VAL" | grep -oP 'secret:\S+')
-    juju grant-secret fernet-key airflow-coordinator-k8s
-    juju config airflow-coordinator-k8s fernet_key_secret="$SECRET_URI"
-    echo "    Fernet key configured: $SECRET_URI"
+    echo "    Fernet key secret: $SECRET_URI"
+    # Export for use in the tfvars file written by terraform-apply
+    echo "$SECRET_URI" > /tmp/airflow-workshop-fernet-uri
 
-# Add all Juju relations (must run AFTER pods are ready)
-add-relations:
+# Initialize Terraform (if needed) and apply
+terraform-apply:
     #!/usr/bin/env bash
     set -euo pipefail
+    FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri)
+    MODEL_UUID=$(juju show-model {{MODEL}} --format=json | jq -r '."{{MODEL}}"["model-uuid"]')
+    echo "    Model UUID : $MODEL_UUID"
+    echo "    Fernet URI : $FERNET_URI"
+    cd terraform
+    [[ -d .terraform ]] || terraform init -backend=false
+    terraform apply -auto-approve \
+      -var="model_uuid=$MODEL_UUID" \
+      -var="fernet_key_secret=$FERNET_URI"
+    cd ..
+    # Grant the fernet secret AFTER the coordinator is deployed
+    juju grant-secret fernet-key airflow-coordinator-k8s 2>/dev/null || true
 
-    echo ">>> Configuring S3 integrator..."
-    juju config s3-integrator \
-      endpoint="{{S3_ENDPOINT}}" \
-      bucket="{{S3_BUCKET}}" \
-      path="spark-events" \
-      region="us-east-1"
-    juju wait-for unit s3-integrator/0 --query='agent-status=="idle"' --timeout=5m
-    juju run s3-integrator/0 sync-s3-credentials \
-      access-key="{{S3_ACCESS}}" \
-      secret-key="{{S3_SECRET}}"
-    echo ">>> S3 configured!"
-
-    echo ">>> Adding database relation first..."
-    juju relate airflow-coordinator-k8s postgresql-k8s 2>/dev/null || true
-    sleep 10
-
-    echo ">>> Adding core component relations..."
-    juju relate airflow-coordinator-k8s airflow-scheduler-k8s 2>/dev/null || true
-    juju relate airflow-coordinator-k8s airflow-dag-processor-k8s 2>/dev/null || true
-    juju relate airflow-coordinator-k8s airflow-triggerer-k8s 2>/dev/null || true
-    sleep 10
-
-    echo ">>> Adding API server relations..."
-    juju relate airflow-coordinator-k8s:airflow-coordinator airflow-api-server-k8s:airflow-coordinator 2>/dev/null || true
-    juju relate airflow-coordinator-k8s:airflow-api-server airflow-api-server-k8s:airflow-api-server 2>/dev/null || true
-    sleep 10
-
-    echo ">>> Adding executor relations..."
-    juju relate airflow-coordinator-k8s:airflow-coordinator airflow-kubernetes-executor-k8s:airflow-config 2>/dev/null || true
-    juju relate airflow-coordinator-k8s:airflow-kubernetes-executor-config airflow-kubernetes-executor-k8s:airflow-executor-config 2>/dev/null || true
-    sleep 10
-
-    echo ">>> Adding S3 relation to coordinator..."
-    juju relate airflow-coordinator-k8s s3-integrator 2>/dev/null || true
-    sleep 15
-
-    echo ">>> Adding Spark S3 relations..."
-    juju relate spark-integration-hub-k8s s3-integrator 2>/dev/null || true
-    juju relate spark-history-server-k8s s3-integrator 2>/dev/null || true
-
-    echo ">>> Setting trust for executors..."
-    juju trust airflow-kubernetes-executor-k8s --scope=cluster
-    juju trust airflow-scheduler-k8s --scope=cluster
-
-    echo ">>> Relations added!"
-
-# Configure executor charm settings
-configure-executor:
-    @echo ">>> Configuring executor..."
-    juju config airflow-kubernetes-executor-k8s \
-      base_image="apache/airflow:3.1.8" \
-      namespace="{{MODEL}}"
-
-# Patch coordinator charm bug (KeyError: tls_ca_chain in connection_manager.py)
-# This is a known bug in rev 33 where S3 relation data without tls-ca-chain crashes the hook.
-patch-coordinator:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Patching coordinator charm (tls_ca_chain bug workaround)..."
-    kubectl cp patches/patch_coordinator.py airflow-coordinator-k8s-0:/tmp/patch.py -c charm -n {{MODEL}}
-    kubectl exec airflow-coordinator-k8s-0 -c charm -n {{MODEL}} -- python3 /tmp/patch.py
-    echo ">>> Coordinator patched!"
-
-# Patch executor pod template to inject S3 connection env var into init container.
-# Without this, the dag-bundle-init container can't find the S3 connection for DAG sync.
-patch-executor:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Patching executor pod template (init container env vars)..."
-    kubectl cp patches/patch_executor.py airflow-kubernetes-executor-k8s-0:/tmp/patch.py -c charm -n {{MODEL}}
-    kubectl exec airflow-kubernetes-executor-k8s-0 -c charm -n {{MODEL}} -- python3 /tmp/patch.py
-    # Force config-changed to re-render the template
-    juju config airflow-kubernetes-executor-k8s pod_name="airflow-worker"
-    sleep 10
-    echo ">>> Executor pod template patched!"
-
-# Configure Spark namespace + RBAC
-configure-spark:
-    @echo ">>> Setting up Spark workloads namespace and RBAC..."
-    kubectl create namespace spark-workloads 2>/dev/null || true
-    sed 's/__MODEL_NS__/{{MODEL}}/g' spark-rbac-manifest.yaml | kubectl apply -f -
-
-# Patch rendered worker pod template on scheduler to inject S3 connection env var.
-# The init container needs this to access S3 for DAG bundle sync.
-# Must run AFTER relations are added (so the S3 connection exists in config).
-patch-s3-worker:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Injecting S3 connection env var into worker pod template..."
-    S3_CONN_URI="aws://{{S3_ACCESS}}:{{S3_SECRET}}@/?region_name=us-east-1&endpoint_url=http%3A%2F%2F{{S3_HOST}}%3A{{S3_PORT}}"
-    # Extract the S3 connection ID from the rendered airflow.cfg (retry up to 20 times)
-    CONN_ID=""
-    for i in $(seq 1 20); do
-        CONN_ID=$(kubectl exec airflow-scheduler-k8s-0 -c airflow-scheduler -n {{MODEL}} -- \
-          grep -oP '"aws_conn_id":\s*"\K[^"]+' /opt/airflow/airflow.cfg 2>/dev/null) || true
-        if [[ -n "$CONN_ID" ]]; then
-            break
-        fi
-        echo "    Waiting for S3 connection ID in config (attempt $i/20)..."
-        sleep 15
-    done
-    if [[ -z "$CONN_ID" ]]; then
-        echo "    ERROR: Could not find S3 connection ID in config after 5 minutes"
-        exit 1
-    fi
-    CONN_ENV_NAME="AIRFLOW_CONN_$(echo "$CONN_ID" | tr '[:lower:]' '[:upper:]')"
-    echo "    Connection ID: $CONN_ID -> env var: $CONN_ENV_NAME"
-    # Copy patch script and run it on the scheduler pod
-    kubectl cp patches/patch_s3_worker.py airflow-scheduler-k8s-0:/tmp/patch_s3.py -c airflow-scheduler -n {{MODEL}}
-    kubectl exec airflow-scheduler-k8s-0 -c airflow-scheduler -n {{MODEL}} -- \
-      env CONN_ENV_NAME="$CONN_ENV_NAME" S3_CONN_URI="$S3_CONN_URI" python3 /tmp/patch_s3.py
-    # Restart scheduler to pick up the new template
-    kubectl exec airflow-scheduler-k8s-0 -c airflow-scheduler -n {{MODEL}} -- \
-      bash -c 'kill $(pgrep -f "airflow scheduler" | head -1)' 2>/dev/null || true
-    sleep 15
-    echo ">>> Worker pod template patched with S3 connection!"
-
-# Upload DAG to MicroCeph S3
-upload-dag:
-    @echo ">>> Uploading DAG to MicroCeph S3..."
-    s3cmd --host={{S3_HOST}}:{{S3_PORT}} --host-bucket= --no-ssl \
-      --access_key={{S3_ACCESS}} --secret_key={{S3_SECRET}} \
-      put dag_parallel_demo.py s3://{{S3_BUCKET}}/spark-events/dag_parallel_demo.py
-    @echo ">>> DAG uploaded. Waiting for DAG processor to detect it..."
-    sleep 10
-    @echo ">>> Restarting DAG processor to force bundle resync..."
-    kubectl exec airflow-dag-processor-k8s-0 -c airflow-dag-processor -n {{MODEL}} -- \
-      bash -c 'kill $$(pgrep -f "airflow dag-processor" | head -1)' 2>/dev/null || true
-    sleep 30
-    @echo ">>> Reserializing DAGs..."
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags reserialize 2>/dev/null || true
-    sleep 5
-    @echo ">>> Checking DAG detection..."
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags list 2>&1 | grep -E "parallel|dag_id" || echo "DAG not yet detected - wait a bit and run: just check-dag"
-
-# ============================================================================
-# DEMO RECIPES
-# ============================================================================
-
-# Wait for all units to be active/idle
+# Wait for all applications to become active
 wait-ready:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Waiting for all units to be active..."
-    # Resolve any error states first
-    for i in 1 2 3 4 5; do
-        STATUS=$(juju status --format=short 2>&1 | grep "error" || true)
-        if [[ -z "$STATUS" ]]; then
-            break
+    echo ">>> Waiting for all units to become active (up to 20 min)..."
+    timeout=1200; elapsed=0; interval=15
+    while [ $elapsed -lt $timeout ]; do
+        if juju wait-for model {{MODEL}} \
+          --query='forEach(applications, app => app.status == "active")' \
+          --timeout=${interval}s 2>/dev/null; then
+            echo ">>> All units active!"
+            exit 0
         fi
-        echo "    Resolving error states (attempt $i)..."
-        juju resolved airflow-coordinator-k8s/0 2>/dev/null || true
-        sleep 20
+        elapsed=$((elapsed + interval))
     done
-    juju wait-for application airflow-coordinator-k8s --query='status=="active"' --timeout=15m
-    juju wait-for application airflow-api-server-k8s --query='status=="active"' --timeout=10m
-    juju wait-for application airflow-scheduler-k8s --query='status=="active"' --timeout=10m
-    juju wait-for application postgresql-k8s --query='status=="active"' --timeout=10m
-    echo ">>> All units active!"
-    juju status --format=short
+    echo "Timed out — check: juju status"
+    exit 1
 
-# Get Airflow UI address
-get-ui-ip:
-    @echo ">>> Airflow UI:"
-    @echo "    http://$(kubectl get pod airflow-api-server-k8s-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080"
-    @echo "    Login: admin / admin"
-
-# Check if DAG is detected
-check-dag:
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags list 2>&1 | grep -E "parallel|dag_id"
-
-# Unpause and trigger the DAG
-trigger:
-    @echo ">>> Triggering parallel_spark_analytics..."
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags unpause parallel_spark_analytics 2>/dev/null || true
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags trigger parallel_spark_analytics
-    @echo ""
-    @echo ">>> DAG triggered! Now run:"
-    @echo "    just watch          # see pods spawning"
-    @echo "    just watch-spark    # see spark pods"
-    @echo "    just status         # check task states"
-
-# Watch ALL pods spawning (worker + spark) - real-time
-watch:
-    @echo ">>> Watching pods (Ctrl+C to stop)..."
-    @echo ">>> Worker pods (airflow-spark namespace):"
-    kubectl get pods -n {{MODEL}} -w --selector='dag_id=parallel_spark_analytics' 2>/dev/null || \
-    kubectl get pods -n {{MODEL}} -w 2>/dev/null | grep -E "parallel\|NAME\|analyze\|ingest\|executive"
-
-# Watch Spark pods in spark-workloads namespace
-watch-spark:
-    @echo ">>> Watching Spark pods (Ctrl+C to stop)..."
-    kubectl get pods -n spark-workloads -w
-
-# Watch BOTH namespaces side-by-side
-watch-all:
-    @echo ">>> Pods in airflow-spark (workers):"
-    kubectl get pods -n {{MODEL}} 2>&1 | grep -E "NAME|parallel|analyze|ingest|executive"
-    @echo ""
-    @echo ">>> Pods in spark-workloads (Spark jobs):"
-    kubectl get pods -n spark-workloads 2>&1
-    @echo ""
-    @echo ">>> For live watch, use: just watch  OR  just watch-spark"
-
-# Check task states for the latest DAG run
-status:
+# Patch spark-role with pods/log + events so KubernetesPodOperator can
+# stream logs and monitor pod lifecycle (the Hub's auto-created role
+# omits these by default).
+fix-spark-rbac:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Latest DAG run task states:"
-    kubectl cp patches/get_latest_run_id.py airflow-api-server-k8s-0:/tmp/get_run_id.py -c airflow-api-server -n {{MODEL}}
-    RUN_ID=$(kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      python3 /tmp/get_run_id.py 2>/dev/null)
-    if [[ -z "$RUN_ID" ]]; then
-        echo "    No DAG runs found"
-        exit 0
-    fi
-    echo "    Run ID: $RUN_ID"
-    kubectl exec airflow-api-server-k8s-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow tasks states-for-dag-run parallel_spark_analytics "$RUN_ID" 2>&1 | tail -10
-
-# View logs for a specific task
-logs task="executive_summary":
-    @echo ">>> Logs for {{task}}:"
-    @POD=$$(kubectl get pods -n {{MODEL}} -o name 2>&1 | grep "{{task}}" | tail -1) && \
-    kubectl logs $$POD -c base -n {{MODEL}} 2>&1 | grep -oP '"event":"\[base\] \K[^"]*' | \
-      grep -v "WARN\|java\|com\.\|at \|hadoop\|aws\|Setting\|You can\|This message\|The AWS" | head -40
-
-# View all completed pod logs
-logs-all:
-    @echo ">>> All task outputs:"
-    @for task in ingest-data analyze-categories analyze-regions analyze-trends executive-summary; do \
-      echo ""; echo "=== $$task ==="; \
-      POD=$$(kubectl get pods -n {{MODEL}} -o name 2>&1 | grep "$$task" | tail -1); \
-      if [ -n "$$POD" ]; then \
-        kubectl logs $$POD -c base -n {{MODEL}} 2>&1 | grep -oP '"event":"\[base\] \K[^"]*' | \
-          grep -v "WARN\|java\|com\.\|at \|hadoop\|aws\|Setting\|You can\|This message\|The AWS" | \
-          grep -E "TASK|===|---|\$|#|=|bar|Revenue|Region|Month|orders|Pipeline|EXEC" | head -20; \
-      fi; \
-    done
+    kubectl patch role spark-role -n {{MODEL}} --type=json -p='[
+      {"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods/log"],"verbs":["get","list","watch"]}},
+      {"op":"add","path":"/rules/-","value":{"apiGroups":["","events.k8s.io"],"resources":["events"],"verbs":["get","list","watch"]}}
+    ]' 2>/dev/null && echo "    spark-role patched." || echo "    spark-role not found yet — re-run after hub creates the SA."
 
 # ============================================================================
-# CLEANUP
+# DEMO OPERATIONS
 # ============================================================================
 
-# Clean up completed pods (keeps the environment tidy between runs)
-clean-pods:
-    @echo ">>> Cleaning completed pods..."
-    kubectl delete pods -n spark-workloads --field-selector=status.phase==Succeeded 2>/dev/null || true
-    kubectl delete pods -n spark-workloads --field-selector=status.phase==Failed 2>/dev/null || true
-    kubectl delete pods -n {{MODEL}} -l kubernetes_pod_operator=True 2>/dev/null || true
-    kubectl delete pods -n {{MODEL}} -l dag_id=parallel_spark_analytics 2>/dev/null || true
+# Print the Airflow UI address
+get-ui-ip:
+    @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-k8s-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080   (admin/admin)"
 
-# Full teardown
+# Trigger the Spark demo DAG
+trigger:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
+      airflow dags unpause spark_demo 2>/dev/null || true
+    kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
+      airflow dags trigger spark_demo
+    echo ">>> Triggered! Run: just watch"
+
+# Watch pods spawning in real-time
+watch:
+    kubectl get pods -n {{MODEL}} -w --output=wide 2>/dev/null | \
+      grep --line-buffered -E "NAME|spark|worker"
+
+# Show latest DAG run states
+status:
+    kubectl exec airflow-api-server-k8s-0 -n {{MODEL}} -c airflow-api-server -- \
+      airflow dags list-runs spark_demo 2>/dev/null | tail -8
+
+# Destroy the model and all deployed resources
 teardown:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Destroying model {{MODEL}}..."
-    juju destroy-model {{MODEL}} --no-prompt --force --no-wait --destroy-storage 2>&1 || true
-    # Wait for model to actually be removed (up to 5 minutes)
-    echo ">>> Waiting for model to be fully removed..."
-    for i in $(seq 1 30); do
-        if ! juju models 2>&1 | grep -q "{{MODEL}}"; then
-            echo "    Model removed!"
-            break
-        fi
-        if [[ "$i" -eq 30 ]]; then
-            echo "    Model stuck in destroying state - force cleaning K8s namespace..."
-            kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
-            sleep 10
-            # If still stuck after ns delete, it will clear on next controller restart
-        fi
-        echo "    Still removing (${i}/30)..."
-        sleep 10
-    done
-    kubectl delete namespace spark-workloads 2>/dev/null || true
-    kubectl delete clusterrole airflow-worker-pod-creator 2>/dev/null || true
-    kubectl delete clusterrolebinding airflow-scheduler-pod-manager airflow-executor-pod-manager default-sa-spark-workloads 2>/dev/null || true
-    echo ">>> Teardown complete."
+    cd terraform
+    MODEL_UUID=$(juju show-model {{MODEL}} --format=json 2>/dev/null | jq -r '."{{MODEL}}"["model-uuid"]' || echo "")
+    if [[ -n "$MODEL_UUID" ]]; then
+        FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri 2>/dev/null || echo "unused")
+        terraform destroy -auto-approve \
+          -var="model_uuid=$MODEL_UUID" \
+          -var="fernet_key_secret=$FERNET_URI" || true
+    fi
+    cd ..
+    juju destroy-model --no-prompt --destroy-storage {{MODEL}} --force 2>/dev/null || true
+    rm -f /tmp/airflow-workshop-fernet-uri
