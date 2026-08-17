@@ -20,50 +20,78 @@
 
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
 
-MODEL := "airflow-spark"
+MODEL           := "airflow-spark"
+COORDINATOR_DIR := env("COORDINATOR_DIR", env("HOME") + "/Desktop/airflow-coordinator-k8s-operator")
+EXECUTOR_DIR    := env("EXECUTOR_DIR", env("HOME") + "/Desktop/airflow-kubernetes-executor-k8s-operator")
 
 # Default: list all recipes
 default:
     @just --list
 
-# Full deployment from scratch
-deploy: create-model configure-fernet terraform-apply wait-ready fix-spark-rbac
+# Full deployment from scratch (cleans up any previous deployment first)
+deploy: cleanup create-model configure-fernet terraform-apply grant-fernet refresh-charms add-spark-relation wait-ready force-reconcile reload-dags
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
-    @echo "  DAG bundles sync from: https://github.com/canonical/workflows-team-workshops"
-    @echo "    → airflow/airflow-spark/dags/"
     @echo "  just trigger  |  just watch  |  just get-ui-ip  |  just teardown"
     @echo "======================================================================"
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+
+# Destroy everything from a previous deployment: model, terraform state, temp files.
+# Safe to run even if nothing exists.
+cleanup:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    echo ">>> Cleaning up any previous deployment..."
+    # Terraform destroy (best-effort — state may not exist)
+    if [[ -f terraform/terraform.tfstate ]]; then
+        MODEL_UUID=$(juju show-model {{MODEL}} --format=json 2>/dev/null \
+          | jq -r '."{{MODEL}}"["model-uuid"]' 2>/dev/null || echo "")
+        if [[ -n "$MODEL_UUID" ]]; then
+            FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri 2>/dev/null || echo "unused")
+            cd terraform && terraform destroy -auto-approve \
+              -var="model_uuid=$MODEL_UUID" \
+              -var="fernet_key_secret=$FERNET_URI" 2>/dev/null || true
+            cd ..
+        fi
+    fi
+    rm -f terraform/terraform.tfstate terraform/terraform.tfstate.backup
+    # Destroy Juju model (secrets are model-scoped and die with it)
+    juju destroy-model --no-prompt --destroy-storage {{MODEL}} --force 2>/dev/null || true
+    # Wait for model to fully disappear
+    for i in $(seq 1 60); do
+        STATUS=$(juju models 2>&1 | grep "{{MODEL}}" | awk '{print $NF}' || true)
+        [[ "$STATUS" == "destroying" || "$STATUS" == "dying" ]] || break
+        echo "    Model still destroying ($i/60)..."
+        [[ "$i" -eq 30 ]] && kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
+        sleep 10
+    done
+    rm -f /tmp/airflow-workshop-fernet-uri
+    echo ">>> Cleanup complete."
 
 # ============================================================================
 # DEPLOYMENT
 # ============================================================================
 
-# Create the Juju model, waiting for any prior one to finish destroying
+# Create a fresh Juju model
 create-model:
     #!/usr/bin/env bash
     set -euo pipefail
-    for i in $(seq 1 60); do
-        STATUS=$(juju models 2>&1 | grep "{{MODEL}}" | awk '{print $NF}' || true)
-        [[ "$STATUS" == "destroying" || "$STATUS" == "dying" ]] || break
-        echo "    Old model still destroying ($i/60)..."
-        [[ "$i" -eq 30 ]] && kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
-        sleep 10
-    done
     juju add-model {{MODEL}}
     juju switch {{MODEL}}
 
-# Generate a fernet key, store as a Juju secret, and export its URI
+# Generate a fernet key, store as a Juju secret, save URI for later steps
 configure-fernet:
     #!/usr/bin/env bash
     set -euo pipefail
     FERNET_VAL=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
     SECRET_URI=$(juju add-secret fernet-key fernet-key="$FERNET_VAL" | grep -oP 'secret:\S+')
     echo "    Fernet key secret: $SECRET_URI"
-    # Export for use in the tfvars file written by terraform-apply
     echo "$SECRET_URI" > /tmp/airflow-workshop-fernet-uri
 
-# Initialize Terraform (if needed) and apply
+# Deploy the full stack via Terraform
 terraform-apply:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -72,13 +100,51 @@ terraform-apply:
     echo "    Model UUID : $MODEL_UUID"
     echo "    Fernet URI : $FERNET_URI"
     cd terraform
-    [[ -d .terraform ]] || terraform init -backend=false
+    [[ -d .terraform ]] || terraform init
     terraform apply -auto-approve \
       -var="model_uuid=$MODEL_UUID" \
       -var="fernet_key_secret=$FERNET_URI"
-    cd ..
-    # Grant the fernet secret AFTER the coordinator is deployed
-    juju grant-secret fernet-key airflow-coordinator-k8s 2>/dev/null || true
+
+# Grant the fernet secret to the coordinator AFTER it's deployed by Terraform.
+# The coordinator app name comes from the charmed-airflow-solutions Terraform
+# module (which names it "airflow-coordinator", not "airflow-coordinator-k8s").
+grant-fernet:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Granting fernet key to coordinator..."
+    # Try both possible app names (Terraform module vs manual deploy)
+    juju grant-secret fernet-key airflow-coordinator 2>/dev/null \
+      || echo "    WARNING: could not grant fernet key"
+
+# Pack and refresh coordinator + executor with local feature branches
+refresh-charms:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Packing coordinator from {{COORDINATOR_DIR}} ..."
+    cd {{COORDINATOR_DIR}} && charmcraft pack --quiet 2>&1 | tail -1
+    COORD=$(ls {{COORDINATOR_DIR}}/airflow-coordinator-k8s_*.charm | tail -1)
+    echo ">>> Refreshing coordinator..."
+    juju refresh airflow-coordinator --path "$COORD" \
+      --resource airflow-coordinator-image=ubuntu/airflow@sha256:0a025779768549281c662b9e01589ce94e4a9d69f0ffd5040fd039104e3c0d59
+
+    echo ">>> Packing executor from {{EXECUTOR_DIR}} ..."
+    cd {{EXECUTOR_DIR}} && charmcraft pack --quiet 2>&1 | tail -1
+    EXEC=$(ls {{EXECUTOR_DIR}}/airflow-kubernetes-executor-k8s_*.charm | tail -1)
+    echo ">>> Refreshing executor..."
+    juju refresh airflow-kubernetes-executor --path "$EXEC"
+    echo ">>> Charms refreshed."
+
+# Add the spark-service-account relation (only possible after coordinator
+# is refreshed with the feature branch that has the endpoint)
+add-spark-relation:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Waiting for refreshed coordinator to settle..."
+    sleep 20
+    echo ">>> Adding spark-service-account relation..."
+    juju integrate airflow-coordinator:spark-service-account \
+                   spark-integration-hub-k8s:spark-service-account
+    echo ">>> Spark relation added."
 
 # Wait for all applications to become active
 wait-ready:
@@ -98,16 +164,41 @@ wait-ready:
     echo "Timed out — check: juju status"
     exit 1
 
-# Patch spark-role with pods/log + events so KubernetesPodOperator can
-# stream logs and monitor pod lifecycle (the Hub's auto-created role
-# omits these by default).
-fix-spark-rbac:
+# Force coordinator to re-distribute config so the executor pod template
+# gets SPARK_NAMESPACE, SPARK_USERNAME, and serviceAccountName.
+# Waits until the pod template actually contains the SPARK vars before returning.
+[private]
+force-reconcile:
     #!/usr/bin/env bash
     set -euo pipefail
-    kubectl patch role spark-role -n {{MODEL}} --type=json -p='[
-      {"op":"add","path":"/rules/-","value":{"apiGroups":[""],"resources":["pods/log"],"verbs":["get","list","watch"]}},
-      {"op":"add","path":"/rules/-","value":{"apiGroups":["","events.k8s.io"],"resources":["events"],"verbs":["get","list","watch"]}}
-    ]' 2>/dev/null && echo "    spark-role patched." || echo "    spark-role not found yet — re-run after hub creates the SA."
+    echo ">>> Triggering coordinator reconcile..."
+    juju config airflow-coordinator core_parallelism=16
+    sleep 5
+    juju config airflow-coordinator core_parallelism=32
+    echo ">>> Waiting for SPARK env vars in pod template..."
+    for i in $(seq 1 40); do
+        if kubectl exec airflow-scheduler-0 -c airflow-scheduler -n {{MODEL}} -- \
+          grep -q "SPARK_NAMESPACE" /opt/airflow/pod_templates/worker_pod_template.yaml 2>/dev/null; then
+            echo "    Pod template updated with SPARK vars."
+            exit 0
+        fi
+        sleep 5
+    done
+    echo "    WARNING: SPARK vars not found in pod template after 200s."
+
+# Force dag-processor to re-clone the git repo so DAGs are available
+# immediately. Without this, the processor uses its cached clone and
+# `just trigger` may fail with "DAG not found" for several minutes.
+[private]
+reload-dags:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Reloading DAG bundles from git..."
+    kubectl exec airflow-dag-processor-0 -c airflow-dag-processor -n {{MODEL}} -- \
+      bash -c 'rm -rf /tmp/airflow/dag_bundles/git_* && kill $(pgrep -f "airflow dag-processor" | head -1)' 2>/dev/null || true
+    sleep 40
+    kubectl exec airflow-api-server-0 -c airflow-api-server -n {{MODEL}} -- \
+      airflow dags list 2>/dev/null | grep -E "dag_id|tiny" || echo "    DAGs not yet detected — wait and retry: just trigger"
 
 # ============================================================================
 # DEMO OPERATIONS
@@ -115,16 +206,16 @@ fix-spark-rbac:
 
 # Print the Airflow UI address
 get-ui-ip:
-    @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-k8s-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080   (admin/admin)"
+    @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080   (admin/admin)"
 
 # Trigger the Spark demo DAG
 trigger:
     #!/usr/bin/env bash
     set -euo pipefail
     kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags unpause spark_demo 2>/dev/null || true
+      airflow dags unpause tiny_spark_demo 2>/dev/null || true
     kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags trigger spark_demo
+      airflow dags trigger tiny_spark_demo
     echo ">>> Triggered! Run: just watch"
 
 # Watch pods spawning in real-time
@@ -134,21 +225,8 @@ watch:
 
 # Show latest DAG run states
 status:
-    kubectl exec airflow-api-server-k8s-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags list-runs spark_demo 2>/dev/null | tail -8
+    kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
+      airflow dags list-runs tiny_spark_demo 2>/dev/null | tail -8
 
-# Destroy the model and all deployed resources
-teardown:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd terraform
-    MODEL_UUID=$(juju show-model {{MODEL}} --format=json 2>/dev/null | jq -r '."{{MODEL}}"["model-uuid"]' || echo "")
-    if [[ -n "$MODEL_UUID" ]]; then
-        FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri 2>/dev/null || echo "unused")
-        terraform destroy -auto-approve \
-          -var="model_uuid=$MODEL_UUID" \
-          -var="fernet_key_secret=$FERNET_URI" || true
-    fi
-    cd ..
-    juju destroy-model --no-prompt --destroy-storage {{MODEL}} --force 2>/dev/null || true
-    rm -f /tmp/airflow-workshop-fernet-uri
+# Destroy the model, terraform state, secrets, and temp files
+teardown: cleanup

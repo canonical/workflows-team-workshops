@@ -28,7 +28,7 @@ module "charmed_airflow" {
   airflow_kubernetes_executor = {
     config = {
       namespace  = "airflow-spark"
-      base_image = "apache/airflow:3.1.8"
+      base_image = "10.0.0.78:5000/airflow-spark8t:3.1.8"
     }
   }
 }
@@ -40,10 +40,10 @@ module "charmed_airflow" {
 module "git_integrator" {
   source     = "git::https://github.com/canonical/git-integrator//terraform?ref=git-integrator-rev5"
   model_uuid = var.model_uuid
+  channel    = "1.0/edge"
   config = {
-    repository_url = "https://github.com/canonical/workflows-team-workshops"
-    tracking_ref   = "main"
-    path           = "airflow/airflow-spark/dags"
+    repository_url = "https://github.com/jananisenthilkumar291/demo-nifi-git-integrator"
+    tracking_ref   = "Demo"
   }
 }
 
@@ -62,9 +62,9 @@ resource "juju_integration" "coordinator_git" {
 }
 
 # ---------------------------------------------------------------------------
-# Spark Integration Hub — auto-creates the Spark SA, RBAC, and config Secret.
-# The coordinator reads namespace + username from the relation and distributes
-# them as SPARK_NAMESPACE / SPARK_USERNAME env vars in worker pods.
+# Spark Integration Hub — deployed here; the spark-service-account relation
+# is added AFTER refreshing the coordinator with the local feature branch
+# (the Charmhub coordinator doesn't have the spark-service-account endpoint).
 # ---------------------------------------------------------------------------
 resource "juju_application" "spark_hub" {
   name       = "spark-integration-hub-k8s"
@@ -73,17 +73,5 @@ resource "juju_application" "spark_hub" {
   charm {
     name    = "spark-integration-hub-k8s"
     channel = "3/stable"
-  }
-}
-
-resource "juju_integration" "coordinator_spark" {
-  model_uuid = var.model_uuid
-  application {
-    name     = module.charmed_airflow.applications.airflow.coordinator.application.name
-    endpoint = "spark-service-account"
-  }
-  application {
-    name     = juju_application.spark_hub.name
-    endpoint = "spark-service-account"
   }
 }
