@@ -28,7 +28,7 @@ module "charmed_airflow" {
   airflow_kubernetes_executor = {
     config = {
       namespace  = "airflow-spark"
-      base_image = "10.0.0.78:5000/airflow-spark8t:3.1.8"
+      base_image = "10.0.0.78:5000/airflow-spark:3.1.8"
     }
   }
 }
@@ -42,8 +42,9 @@ module "git_integrator" {
   model_uuid = var.model_uuid
   channel    = "1.0/edge"
   config = {
-    repository_url = "https://github.com/jananisenthilkumar291/demo-nifi-git-integrator"
-    tracking_ref   = "Demo"
+    repository_url = "https://github.com/canonical/workflows-team-workshops"
+    tracking_ref   = "feature/airflow-spark"
+    path = "./airflow/airflow-spark/dags/"
   }
 }
 

@@ -29,7 +29,7 @@ default:
     @just --list
 
 # Full deployment from scratch (cleans up any previous deployment first)
-deploy: cleanup create-model configure-fernet terraform-apply grant-fernet refresh-charms add-spark-relation wait-ready force-reconcile reload-dags
+deploy: cleanup push-image create-model configure-fernet terraform-apply grant-fernet refresh-charms add-spark-relation wait-ready force-reconcile reload-dags
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
     @echo "  just trigger  |  just watch  |  just get-ui-ip  |  just teardown"
@@ -116,6 +116,37 @@ grant-fernet:
     juju grant-secret fernet-key airflow-coordinator 2>/dev/null \
       || echo "    WARNING: could not grant fernet key"
 
+# Configure containerd to allow pulling from the insecure HTTP registry
+# and push the airflow-spark rock image to it.
+ROCK_PATH       := env("ROCK_PATH", env("HOME") + "/Desktop/airflow-rocks/3.1/airflow_3.1.8_amd64.rock")
+REGISTRY        := "10.0.0.78:5000"
+SPARK_IMAGE     := REGISTRY + "/airflow-spark:3.1.8"
+
+push-image:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Configuring containerd to allow insecure registry {{REGISTRY}}..."
+    sudo mkdir -p /etc/containerd/hosts.d/{{REGISTRY}}
+    sudo tee /etc/containerd/hosts.d/{{REGISTRY}}/hosts.toml > /dev/null <<EOF
+    server = "http://{{REGISTRY}}"
+
+    [host."http://{{REGISTRY}}"]
+      capabilities = ["pull", "resolve"]
+      skip_verify = true
+    EOF
+    echo ">>> Restarting k8s snap to apply containerd config..."
+    sudo snap restart k8s
+    sleep 10
+    echo ">>> Pushing rock image to {{SPARK_IMAGE}}..."
+    sudo rockcraft.skopeo --insecure-policy copy \
+      oci-archive:{{ROCK_PATH}} docker-daemon:{{SPARK_IMAGE}}
+    sudo rockcraft.skopeo --insecure-policy copy --dest-tls-verify=false \
+      docker-daemon:{{SPARK_IMAGE}} docker://{{SPARK_IMAGE}}
+    echo ">>> Verifying image in registry..."
+    curl -sf http://{{REGISTRY}}/v2/airflow-spark/tags/list
+    echo ""
+    echo ">>> Image pushed successfully."
+
 # Pack and refresh coordinator + executor with local feature branches
 refresh-charms:
     #!/usr/bin/env bash
@@ -163,6 +194,24 @@ wait-ready:
     done
     echo "Timed out — check: juju status"
     exit 1
+
+# Wait for the Hub to create spark-role, then patch it with events permission
+# so KubernetesExecutor can detect worker pod completion.
+fix-spark-rbac:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Waiting for spark-role to be created by the Hub..."
+    for i in $(seq 1 60); do
+        if kubectl get role spark-role -n {{MODEL}} &>/dev/null; then
+            kubectl patch role spark-role -n {{MODEL}} --type=json -p='[
+              {"op":"add","path":"/rules/-","value":{"apiGroups":["","events.k8s.io"],"resources":["events"],"verbs":["get","list","watch"]}}
+            ]' && echo "    spark-role patched."
+            exit 0
+        fi
+        echo "    spark-role not found yet ($i/60)..."
+        sleep 5
+    done
+    echo "    WARNING: spark-role never appeared — spark tasks may fail."
 
 # Force coordinator to re-distribute config so the executor pod template
 # gets SPARK_NAMESPACE, SPARK_USERNAME, and serviceAccountName.

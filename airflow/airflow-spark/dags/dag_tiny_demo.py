@@ -1,25 +1,24 @@
 import os
 from datetime import timedelta
 from airflow.sdk import DAG
+from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 
-# Injected natively by the Kubernetes Executor charm via the
-# airflow-coordinator ↔ spark-integration-hub relation.
-SA, NS = os.environ.get("SPARK_USERNAME", "spark"), os.environ.get("SPARK_NAMESPACE", "airflow-spark")
-IMAGE  = "ghcr.io/canonical/charmed-spark:3.5-22.04_edge"
-CMD    = (f"echo 'from pyspark.sql import SparkSession;"
-          f"spark=SparkSession.builder.appName(\"Demo\").getOrCreate();"
-          f"print(\"rows:\", spark.range(3).count());spark.stop()' > /tmp/j.py"
-          f" && python3 -m spark8t.cli.spark_submit"
-          f" --username {SA} --namespace {NS} --deploy-mode client /tmp/j.py")
+SA = os.environ.get("SPARK_USERNAME", "spark")
+NS = os.environ.get("SPARK_NAMESPACE", "airflow-spark")
 
-with DAG("spark_demo", schedule=None, catchup=False,
-         default_args={"retries": 0, "execution_timeout": timedelta(minutes=10)}) as dag:
+with DAG("tiny_spark_demo", schedule=None, catchup=False,
+         default_args={"retries": 0, "execution_timeout": timedelta(minutes=30)}) as dag:
     hello = PythonOperator(task_id="hello", python_callable=lambda: print(f"SA={SA} NS={NS}"))
-    spark = KubernetesPodOperator(
-        task_id="spark_job", name="spark-job", namespace=NS, image=IMAGE,
-        cmds=["/bin/bash", "-c"], arguments=[CMD],
-        service_account_name=SA, get_logs=True, is_delete_operator_pod=False,
+    spark = BashOperator(
+        task_id="spark_job",
+        bash_command=(
+            "set -ex && export PATH=$JAVA_HOME/bin:$PATH && "
+            "java -version 2>&1 && "
+            "python3 -c 'import pyspark; print(\"pyspark:\", pyspark.__version__)' && "
+            "echo 'print(42)' > /tmp/j.py && "
+            f"timeout 120 python3 -m spark8t.cli.spark_submit --log-level DEBUG --username {SA} --namespace {NS}"
+            " --deploy-mode client /tmp/j.py 2>&1; echo EXIT=$?"
+        ),
     )
     hello >> spark
