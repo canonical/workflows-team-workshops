@@ -28,7 +28,7 @@ module "charmed_airflow" {
   airflow_kubernetes_executor = {
     config = {
       namespace  = "airflow-spark"
-      base_image = "10.0.0.78:5000/airflow-spark:3.1.8"
+      base_image = "ghcr.io/canonical/airflow-spark:3.1.8"
     }
   }
 }
