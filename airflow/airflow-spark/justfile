@@ -21,15 +21,13 @@
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
 
 MODEL           := "airflow-spark"
-COORDINATOR_DIR := env("COORDINATOR_DIR", env("HOME") + "/Desktop/airflow-coordinator-k8s-operator")
-EXECUTOR_DIR    := env("EXECUTOR_DIR", env("HOME") + "/Desktop/airflow-kubernetes-executor-k8s-operator")
 
 # Default: list all recipes
 default:
     @just --list
 
 # Full deployment from scratch (cleans up any previous deployment first)
-deploy: cleanup create-model configure-fernet terraform-apply grant-fernet refresh-charms add-spark-relation wait-ready force-reconcile reload-dags
+deploy: cleanup create-model configure-fernet terraform-apply grant-fernet add-spark-relation wait-ready reload-dags
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
     @echo "  just trigger  |  just watch  |  just get-ui-ip  |  just teardown"
@@ -116,31 +114,10 @@ grant-fernet:
     juju grant-secret fernet-key airflow-coordinator 2>/dev/null \
       || echo "    WARNING: could not grant fernet key"
 
-# Pack and refresh coordinator + executor with local feature branches
-refresh-charms:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Packing coordinator from {{COORDINATOR_DIR}} ..."
-    cd {{COORDINATOR_DIR}} && charmcraft pack --quiet 2>&1 | tail -1
-    COORD=$(ls {{COORDINATOR_DIR}}/airflow-coordinator-k8s_*.charm | tail -1)
-    echo ">>> Refreshing coordinator..."
-    juju refresh airflow-coordinator --path "$COORD" \
-      --resource airflow-coordinator-image=ubuntu/airflow@sha256:0a025779768549281c662b9e01589ce94e4a9d69f0ffd5040fd039104e3c0d59
-
-    echo ">>> Packing executor from {{EXECUTOR_DIR}} ..."
-    cd {{EXECUTOR_DIR}} && charmcraft pack --quiet 2>&1 | tail -1
-    EXEC=$(ls {{EXECUTOR_DIR}}/airflow-kubernetes-executor-k8s_*.charm | tail -1)
-    echo ">>> Refreshing executor..."
-    juju refresh airflow-kubernetes-executor --path "$EXEC"
-    echo ">>> Charms refreshed."
-
-# Add the spark-service-account relation (only possible after coordinator
-# is refreshed with the feature branch that has the endpoint)
+# Add the spark-service-account relation to the coordinator
 add-spark-relation:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Waiting for refreshed coordinator to settle..."
-    sleep 20
     echo ">>> Adding spark-service-account relation..."
     juju integrate airflow-coordinator:spark-service-account \
                    spark-integration-hub-k8s:spark-service-account
@@ -181,28 +158,6 @@ fix-spark-rbac:
         sleep 5
     done
     echo "    WARNING: spark-role never appeared — spark tasks may fail."
-
-# Force coordinator to re-distribute config so the executor pod template
-# gets SPARK_NAMESPACE, SPARK_USERNAME, and serviceAccountName.
-# Waits until the pod template actually contains the SPARK vars before returning.
-[private]
-force-reconcile:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Triggering coordinator reconcile..."
-    juju config airflow-coordinator core_parallelism=16
-    sleep 5
-    juju config airflow-coordinator core_parallelism=32
-    echo ">>> Waiting for SPARK env vars in pod template..."
-    for i in $(seq 1 40); do
-        if kubectl exec airflow-scheduler-0 -c airflow-scheduler -n {{MODEL}} -- \
-          grep -q "SPARK_NAMESPACE" /opt/airflow/pod_templates/worker_pod_template.yaml 2>/dev/null; then
-            echo "    Pod template updated with SPARK vars."
-            exit 0
-        fi
-        sleep 5
-    done
-    echo "    WARNING: SPARK vars not found in pod template after 200s."
 
 # Force dag-processor to re-clone the git repo so DAGs are available
 # immediately. Without this, the processor uses its cached clone and
