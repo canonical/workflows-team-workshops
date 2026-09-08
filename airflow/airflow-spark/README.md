@@ -1,3 +1,4 @@
+# Charmed Airflow + Spark Workshop
 
 Deploy Airflow 3.x with Spark integration using Canonical's charmed operators.
 Worker pods get Spark credentials injected automatically via the
@@ -35,6 +36,9 @@ just watch
 # Get the Airflow UI address
 just get-ui-ip
 
+# Get airflow api server credentials
+just get-api-server-creds
+
 # Tear down
 just teardown
 ```
@@ -48,17 +52,17 @@ just teardown
 | `just watch` | Live-watch worker/spark pods |
 | `just status` | Show latest DAG run task states |
 | `just get-ui-ip` | Print Airflow UI address (admin/admin) |
+| `just get-api-server-creds` | Print Airflow API server admin credentials |
 | `just teardown` | Destroy model and clean up |
 
 ## How It Works
 
 1. **Terraform** deploys the charmed-airflow-solutions module with KubernetesExecutor,
    plus git-integrator and Spark Integration Hub.
-2. Local feature branches of the **coordinator** and **executor** charms are packed
-   and refreshed (they add the `spark-service-account` relation endpoint).
-3. The coordinator relates to the Spark Hub, which creates a ServiceAccount with
-   RBAC permissions. The coordinator passes `{spark_namespace, spark_username}` via
-   `extra_data` to the executor.
+2. The **justfile** relates the coordinator to the Spark Hub via the
+   `spark-service-account` endpoint (`just add-spark-relation`).
+3. The Spark Hub creates a ServiceAccount with RBAC permissions. The coordinator
+   passes `{spark_namespace, spark_username}` via `extra_data` to the executor.
 4. The executor injects `SPARK_NAMESPACE` and `SPARK_USERNAME` as env vars into
    worker pods. DAG code reads these with `os.environ`.
 

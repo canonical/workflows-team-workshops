@@ -1,6 +1,3 @@
-# Copyright 2026 Canonical Ltd.
-# See LICENSE file for licensing details.
-#
 # Charmed Airflow + Spark workshop deployment
 #
 # Stack:
@@ -44,7 +41,7 @@ module "git_integrator" {
   config = {
     repository_url = "https://github.com/canonical/workflows-team-workshops"
     tracking_ref   = "feature/airflow-spark"
-    path = "./airflow/airflow-spark/dags/"
+    path           = "./airflow/airflow-spark/dags/"
   }
 }
 
@@ -63,9 +60,9 @@ resource "juju_integration" "coordinator_git" {
 }
 
 # ---------------------------------------------------------------------------
-# Spark Integration Hub — deployed here; the spark-service-account relation
-# is added AFTER refreshing the coordinator with the local feature branch
-# (the Charmhub coordinator doesn't have the spark-service-account endpoint).
+# Spark Integration Hub — creates the Spark ServiceAccount + RBAC + config
+# Secret. The justfile adds the spark-service-account relation to the
+# coordinator after deploy (see `add-spark-relation`).
 # ---------------------------------------------------------------------------
 resource "juju_application" "spark_hub" {
   name       = "spark-integration-hub-k8s"

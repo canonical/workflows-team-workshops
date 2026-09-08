@@ -37,8 +37,7 @@ deploy: cleanup create-model configure-fernet terraform-apply grant-fernet add-s
 # CLEANUP
 # ============================================================================
 
-# Destroy everything from a previous deployment: model, terraform state, temp files.
-# Safe to run even if nothing exists.
+# Destroy any previous deployment: terraform state, model, secrets, temp files
 cleanup:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -103,14 +102,11 @@ terraform-apply:
       -var="model_uuid=$MODEL_UUID" \
       -var="fernet_key_secret=$FERNET_URI"
 
-# Grant the fernet secret to the coordinator AFTER it's deployed by Terraform.
-# The coordinator app name comes from the charmed-airflow-solutions Terraform
-# module (which names it "airflow-coordinator", not "airflow-coordinator-k8s").
+# Grant the fernet-key secret to the coordinator after Terraform deploys it
 grant-fernet:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Granting fernet key to coordinator..."
-    # Try both possible app names (Terraform module vs manual deploy)
     juju grant-secret fernet-key airflow-coordinator 2>/dev/null \
       || echo "    WARNING: could not grant fernet key"
 
@@ -128,7 +124,7 @@ wait-ready:
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> Waiting for all units to become active (up to 20 min)..."
-    timeout=1200; elapsed=0; interval=15
+    timeout=3600; elapsed=0; interval=15
     while [ $elapsed -lt $timeout ]; do
         if juju wait-for model {{MODEL}} \
           --query='forEach(applications, app => app.status == "active")' \
@@ -141,27 +137,7 @@ wait-ready:
     echo "Timed out — check: juju status"
     exit 1
 
-# Wait for the Hub to create spark-role, then patch it with events permission
-# so KubernetesExecutor can detect worker pod completion.
-fix-spark-rbac:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Waiting for spark-role to be created by the Hub..."
-    for i in $(seq 1 60); do
-        if kubectl get role spark-role -n {{MODEL}} &>/dev/null; then
-            kubectl patch role spark-role -n {{MODEL}} --type=json -p='[
-              {"op":"add","path":"/rules/-","value":{"apiGroups":["","events.k8s.io"],"resources":["events"],"verbs":["get","list","watch"]}}
-            ]' && echo "    spark-role patched."
-            exit 0
-        fi
-        echo "    spark-role not found yet ($i/60)..."
-        sleep 5
-    done
-    echo "    WARNING: spark-role never appeared — spark tasks may fail."
-
-# Force dag-processor to re-clone the git repo so DAGs are available
-# immediately. Without this, the processor uses its cached clone and
-# `just trigger` may fail with "DAG not found" for several minutes.
+# Force dag-processor to re-clone the git repo so DAGs appear immediately
 [private]
 reload-dags:
     #!/usr/bin/env bash
@@ -180,6 +156,10 @@ reload-dags:
 # Print the Airflow UI address
 get-ui-ip:
     @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080   (admin/admin)"
+
+# Print the Airflow API server admin credentials
+get-api-server-creds:
+    @echo "Airflow API Server credentials: admin/$(kubectl exec -it -n {{MODEL}} -c airflow-api-server airflow-api-server-0 -- cat /opt/airflow/simple_auth_manager_passwords.json.generated | jq -r '.admin')"
 
 # Trigger the Spark demo DAG
 trigger:
