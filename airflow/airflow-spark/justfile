@@ -5,32 +5,48 @@
 #   - KubernetesExecutor  (ephemeral worker pods per task)
 #   - git-integrator      (DAG sync from this repo's dags/ folder)
 #   - Spark Integration Hub (auto-creates Spark SA + RBAC + config Secret)
+#   - s3-integrator       (MicroCeph S3 credentials for Spark event logs)
+#   - Spark History Server (UI for completed/running Spark apps)
 #
 # SPARK_NAMESPACE and SPARK_USERNAME are injected natively into worker pods by
 # the executor charm via the coordinator ↔ Spark Hub relation.
 # DAG code reads them with os.environ.get("SPARK_NAMESPACE") / SPARK_USERNAME.
 #
-# Prerequisites: juju bootstrapped, kubectl, terraform, just, python3 + cryptography
+# Prerequisites: juju bootstrapped, kubectl, terraform, just, python3 + cryptography,
+#                MicroCeph with the RGW (S3) service enabled, s3cmd
 #
 # Usage:
 #   just deploy     # Full deployment from scratch (~15 min)
-#   just trigger    # Trigger the spark_demo DAG
-#   just watch      # Watch pods spawning
-#   just teardown   # Destroy everything
+#   just trigger [DAG]  # Trigger a DAG (default: tiny_spark_demo)
+#   just watch          # Watch Airflow worker pods spawning
+#   just watch-spark    # Watch Spark driver/executor pods
+#   just ui-airflow     # Port-forward the Airflow UI to localhost:8080
+#   just ui-history     # Port-forward the Spark History Server to localhost:18080
+#   just teardown       # Destroy everything
 
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
 
-MODEL           := "airflow-spark"
+# Juju model = namespace for the charm Pods (coordinator, api-server, db, hub, s3, history)
+MODEL           := "demo"
+# Namespace where the KubernetesExecutor schedules Airflow worker Pods
+WORKER_NS       := "airflow-worker-namespace"
+# Namespace where the Spark service account lives and Spark pods run (fixed in the coordinator charm)
+SPARK_NS        := "airflow-spark"
+S3_BUCKET       := "spark-history"
+S3_PREFIX       := "spark-events"
+# Locally-built executor charm carrying the Spark RBAC fix (temporary bridge
+# until the fix is released on airflow-kubernetes-executor-k8s)
+EXECUTOR_CHARM  := env("HOME") + "/Desktop/airflow-kubernetes-executor-k8s-operator/airflow-kubernetes-executor-k8s_amd64.charm"
 
 # Default: list all recipes
 default:
     @just --list
 
 # Full deployment from scratch (cleans up any previous deployment first)
-deploy: cleanup create-model configure-fernet terraform-apply grant-fernet add-spark-relation wait-ready reload-dags
+deploy: cleanup create-model create-namespaces configure-microceph configure-fernet terraform-apply refresh-executor grant-secrets wait-ready
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
-    @echo "  just trigger  |  just watch  |  just get-ui-ip  |  just teardown"
+    @echo "  just trigger  |  just watch  |  just watch-spark  |  just ui-airflow"
     @echo "======================================================================"
 
 # ============================================================================
@@ -48,15 +64,23 @@ cleanup:
           | jq -r '."{{MODEL}}"["model-uuid"]' 2>/dev/null || echo "")
         if [[ -n "$MODEL_UUID" ]]; then
             FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri 2>/dev/null || echo "unused")
+            S3_URI=$(cat /tmp/airflow-workshop-s3-uri 2>/dev/null || echo "unused")
+            S3_ENDPOINT=$(cat /tmp/airflow-workshop-s3-endpoint 2>/dev/null || echo "http://unused:80")
             cd terraform && terraform destroy -auto-approve \
               -var="model_uuid=$MODEL_UUID" \
-              -var="fernet_key_secret=$FERNET_URI" 2>/dev/null || true
+              -var="fernet_key_secret=$FERNET_URI" \
+              -var="s3_credentials_secret=$S3_URI" \
+              -var="s3_endpoint=$S3_ENDPOINT" 2>/dev/null || true
             cd ..
         fi
     fi
     rm -f terraform/terraform.tfstate terraform/terraform.tfstate.backup
+    rm -f /tmp/airflow-workshop-s3-uri /tmp/airflow-workshop-s3-endpoint
     # Destroy Juju model (secrets are model-scoped and die with it)
     juju destroy-model --no-prompt --destroy-storage {{MODEL}} --force 2>/dev/null || true
+    # Remove the worker + Spark namespaces created outside the model
+    kubectl delete namespace {{WORKER_NS}} --ignore-not-found 2>/dev/null || true
+    kubectl delete namespace {{SPARK_NS}} --ignore-not-found 2>/dev/null || true
     # Wait for model to fully disappear
     for i in $(seq 1 60); do
         STATUS=$(juju models 2>&1 | grep "{{MODEL}}" | awk '{print $NF}' || true)
@@ -79,6 +103,38 @@ create-model:
     juju add-model {{MODEL}}
     juju switch {{MODEL}}
 
+# Pre-create the worker + Spark namespaces (the charms require them to exist)
+create-namespaces:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Ensuring worker + Spark namespaces exist..."
+    kubectl create namespace {{WORKER_NS}} 2>/dev/null || true
+    kubectl create namespace {{SPARK_NS}} 2>/dev/null || true
+
+# Ensure the MicroCeph S3 user + bucket exist and stash creds/endpoint for Terraform
+configure-microceph:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Configuring MicroCeph S3 backend..."
+    sudo microceph.radosgw-admin user info --uid spark >/dev/null 2>&1 \
+      || sudo microceph.radosgw-admin user create --uid spark --display-name "Spark" >/dev/null
+    ACCESS=$(sudo microceph.radosgw-admin user info --uid spark | jq -r '.keys[0].access_key')
+    SECRET=$(sudo microceph.radosgw-admin user info --uid spark | jq -r '.keys[0].secret_key')
+    S3_HOST=$(hostname -I | awk '{print $1}')
+    S3="s3cmd --host=$S3_HOST:80 --host-bucket= --no-ssl --access_key=$ACCESS --secret_key=$SECRET"
+    $S3 mb s3://{{S3_BUCKET}} 2>/dev/null || true
+    echo "" | $S3 put - s3://{{S3_BUCKET}}/{{S3_PREFIX}}/.keep 2>/dev/null || true
+    # Stage the PySpark job files that the DAGs submit in cluster mode
+    for f in spark_jobs/*.py; do
+        $S3 put "$f" "s3://{{S3_BUCKET}}/jobs/$(basename "$f")"
+    done
+    # Store the S3 credentials in a model-scoped Juju secret for Terraform to reference
+    SECRET_URI=$(juju add-secret s3-creds access-key="$ACCESS" secret-key="$SECRET" | grep -oP 'secret:\S+')
+    echo "$SECRET_URI" > /tmp/airflow-workshop-s3-uri
+    echo "http://$S3_HOST:80" > /tmp/airflow-workshop-s3-endpoint
+    echo "    S3 endpoint : http://$S3_HOST:80"
+    echo "    S3 secret   : $SECRET_URI"
+
 # Generate a fernet key, store as a Juju secret, save URI for later steps
 configure-fernet:
     #!/usr/bin/env bash
@@ -93,37 +149,43 @@ terraform-apply:
     #!/usr/bin/env bash
     set -euo pipefail
     FERNET_URI=$(cat /tmp/airflow-workshop-fernet-uri)
+    S3_URI=$(cat /tmp/airflow-workshop-s3-uri)
+    S3_ENDPOINT=$(cat /tmp/airflow-workshop-s3-endpoint)
     MODEL_UUID=$(juju show-model {{MODEL}} --format=json | jq -r '."{{MODEL}}"["model-uuid"]')
-    echo "    Model UUID : $MODEL_UUID"
-    echo "    Fernet URI : $FERNET_URI"
+    echo "    Model UUID  : $MODEL_UUID"
+    echo "    Fernet URI  : $FERNET_URI"
+    echo "    S3 endpoint : $S3_ENDPOINT"
     cd terraform
     [[ -d .terraform ]] || terraform init
     terraform apply -auto-approve \
       -var="model_uuid=$MODEL_UUID" \
-      -var="fernet_key_secret=$FERNET_URI"
+      -var="fernet_key_secret=$FERNET_URI" \
+      -var="s3_credentials_secret=$S3_URI" \
+      -var="s3_endpoint=$S3_ENDPOINT"
 
-# Grant the fernet-key secret to the coordinator after Terraform deploys it
-grant-fernet:
+# Refresh the executor with the locally-built charm (Spark RBAC fix).
+# Temporary bridge until the RBAC fix lands in a released airflow-kubernetes-executor-k8s.
+refresh-executor:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Granting fernet key to coordinator..."
+    echo ">>> Refreshing airflow-kubernetes-executor with local charm..."
+    juju refresh airflow-kubernetes-executor -m {{MODEL}} --path "{{EXECUTOR_CHARM}}"
+
+# Grant the fernet-key and s3-creds secrets to their apps after Terraform deploys them
+grant-secrets:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Granting secrets to their applications..."
     juju grant-secret fernet-key airflow-coordinator 2>/dev/null \
       || echo "    WARNING: could not grant fernet key"
-
-# Add the spark-service-account relation to the coordinator
-add-spark-relation:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Adding spark-service-account relation..."
-    juju integrate airflow-coordinator:spark-service-account \
-                   spark-integration-hub-k8s:spark-service-account
-    echo ">>> Spark relation added."
+    juju grant-secret s3-creds s3-integrator 2>/dev/null \
+      || echo "    WARNING: could not grant s3 credentials"
 
 # Wait for all applications to become active
 wait-ready:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo ">>> Waiting for all units to become active (up to 20 min)..."
+    echo ">>> Waiting for all units to become active (up to 60 min)..."
     timeout=3600; elapsed=0; interval=15
     while [ $elapsed -lt $timeout ]; do
         if juju wait-for model {{MODEL}} \
@@ -137,49 +199,55 @@ wait-ready:
     echo "Timed out — check: juju status"
     exit 1
 
-# Force dag-processor to re-clone the git repo so DAGs appear immediately
-[private]
-reload-dags:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Reloading DAG bundles from git..."
-    kubectl exec airflow-dag-processor-0 -c airflow-dag-processor -n {{MODEL}} -- \
-      bash -c 'rm -rf /tmp/airflow/dag_bundles/git_* && kill $(pgrep -f "airflow dag-processor" | head -1)' 2>/dev/null || true
-    sleep 40
-    kubectl exec airflow-api-server-0 -c airflow-api-server -n {{MODEL}} -- \
-      airflow dags list 2>/dev/null | grep -E "dag_id|tiny" || echo "    DAGs not yet detected — wait and retry: just trigger"
-
 # ============================================================================
 # DEMO OPERATIONS
 # ============================================================================
 
-# Print the Airflow UI address
-get-ui-ip:
-    @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080   (admin/admin)"
+# Port-forward the Airflow web UI to http://localhost:8080
+ui-airflow:
+    @echo "Airflow UI: http://localhost:8080  (login: just get-api-server-creds)"
+    kubectl port-forward -n {{MODEL}} svc/airflow-api-server 8080:8080
+
+# Port-forward the Spark History Server UI to http://localhost:18080
+ui-history:
+    @echo "Spark History Server: http://localhost:18080"
+    kubectl port-forward -n {{MODEL}} svc/spark-history-server-k8s 18080:18080
 
 # Print the Airflow API server admin credentials
 get-api-server-creds:
     @echo "Airflow API Server credentials: admin/$(kubectl exec -it -n {{MODEL}} -c airflow-api-server airflow-api-server-0 -- cat /opt/airflow/simple_auth_manager_passwords.json.generated | jq -r '.admin')"
 
-# Trigger the Spark demo DAG
-trigger:
+# Trigger a DAG by id, e.g. `just trigger spark_session_demo` (default: tiny_spark_demo)
+trigger DAG="tiny_spark_demo":
     #!/usr/bin/env bash
     set -euo pipefail
+    echo ">>> Waiting for {{DAG}} to be synced from git..."
+    for i in $(seq 1 30); do
+        if kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
+             airflow dags list 2>/dev/null | grep -q "{{DAG}}"; then
+            break
+        fi
+        [[ "$i" -eq 30 ]] && { echo "    DAG not detected yet — retry: just trigger {{DAG}}"; exit 1; }
+        sleep 10
+    done
     kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags unpause tiny_spark_demo 2>/dev/null || true
+      airflow dags unpause {{DAG}} 2>/dev/null || true
     kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags trigger tiny_spark_demo
-    echo ">>> Triggered! Run: just watch"
+      airflow dags trigger {{DAG}}
+    echo ">>> Triggered {{DAG}}! Run: just watch  |  just watch-spark"
 
-# Watch pods spawning in real-time
+# Watch Airflow worker pods spawning in the worker namespace
 watch:
-    kubectl get pods -n {{MODEL}} -w --output=wide 2>/dev/null | \
-      grep --line-buffered -E "NAME|spark|worker"
+    kubectl get pods -n {{WORKER_NS}} -w --output=wide
 
-# Show latest DAG run states
-status:
+# Watch Spark driver/executor pods in the Spark namespace
+watch-spark:
+    kubectl get pods -n {{SPARK_NS}} -w --output=wide
+
+# Show latest run states for a DAG (default: tiny_spark_demo)
+status DAG="tiny_spark_demo":
     kubectl exec airflow-api-server-0 -n {{MODEL}} -c airflow-api-server -- \
-      airflow dags list-runs tiny_spark_demo 2>/dev/null | tail -8
+      airflow dags list-runs {{DAG}} 2>/dev/null | tail -8
 
 # Destroy the model, terraform state, secrets, and temp files
 teardown: cleanup
