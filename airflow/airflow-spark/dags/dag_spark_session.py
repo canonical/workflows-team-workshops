@@ -25,9 +25,13 @@ with DAG(
 ) as dag:
     spark_session_job = BashOperator(
         task_id="spark_session_job",
+        # Cluster-mode spark-submit exits 0 even when the app fails, so the task
+        # succeeds/fails based on the driver's final phase in the output.
         bash_command=(
-            "set -ex && export PATH=$JAVA_HOME/bin:$PATH && "
+            "set -o pipefail && export PATH=$JAVA_HOME/bin:$PATH && "
             f"python3 -m spark8t.cli.spark_submit --username {SA} --namespace {NS} "
-            f"--deploy-mode cluster {JOB_URI}"
+            f"--deploy-mode cluster {JOB_URI} 2>&1 | tee /tmp/spark.out; "
+            "grep -q 'phase: Failed' /tmp/spark.out && { echo '>>> Spark application FAILED'; exit 1; }; "
+            "grep -q 'phase: Succeeded' /tmp/spark.out || { echo '>>> Spark application did not succeed'; exit 1; }"
         ),
     )
