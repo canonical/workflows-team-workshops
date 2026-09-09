@@ -18,7 +18,7 @@ with DAG("tiny_spark_demo", schedule=None, catchup=False,
             "python3 -c 'import pyspark; print(\"pyspark:\", pyspark.__version__)' && "
             "echo 'print(42)' > /tmp/j.py && "
             f"timeout 120 python3 -m spark8t.cli.spark_submit --log-level DEBUG --username {SA} --namespace {NS}"
-            " --deploy-mode client /tmp/j.py 2>&1; echo EXIT=$?"
+            " --deploy-mode cluster /tmp/j.py 2>&1; echo EXIT=$?"
         ),
     )
     hello >> spark
