@@ -20,8 +20,8 @@
 #   just trigger [DAG]  # Trigger a DAG (default: tiny_spark_demo)
 #   just watch          # Watch Airflow worker pods spawning
 #   just watch-spark    # Watch Spark driver/executor pods
-#   just ui-airflow     # Port-forward the Airflow UI to localhost:8080
-#   just ui-history     # Port-forward the Spark History Server to localhost:18080
+#   just get-ui-ip       # Print the Airflow UI address
+#   just get-spark-ui-ip # Print the Spark History Server UI address
 #   just teardown       # Destroy everything
 
 export JUJU_DATA := env("HOME") + "/.local/share/juju"
@@ -34,19 +34,16 @@ WORKER_NS       := "airflow-worker-namespace"
 SPARK_NS        := "airflow-spark"
 S3_BUCKET       := "spark-history"
 S3_PREFIX       := "spark-events"
-# Locally-built executor charm carrying the Spark RBAC fix (temporary bridge
-# until the fix is released on airflow-kubernetes-executor-k8s)
-EXECUTOR_CHARM  := env("HOME") + "/Desktop/airflow-kubernetes-executor-k8s-operator/airflow-kubernetes-executor-k8s_amd64.charm"
 
 # Default: list all recipes
 default:
     @just --list
 
 # Full deployment from scratch (cleans up any previous deployment first)
-deploy: cleanup create-model create-namespaces configure-microceph configure-fernet terraform-apply refresh-executor grant-secrets wait-ready
+deploy: cleanup create-model create-namespaces configure-microceph configure-fernet terraform-apply grant-secrets wait-ready
     @echo "======================================================================"
     @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}"
-    @echo "  just trigger  |  just watch  |  just watch-spark  |  just ui-airflow"
+    @echo "  just trigger  |  just watch  |  just watch-spark  |  just get-ui-ip"
     @echo "======================================================================"
 
 # ============================================================================
@@ -89,6 +86,14 @@ cleanup:
         [[ "$i" -eq 30 ]] && kubectl delete ns {{MODEL}} --force --grace-period=0 2>/dev/null || true
         sleep 10
     done
+    # Delete the MicroCeph S3 bucket + objects (host-level, outside Juju's lifecycle)
+    if sudo microceph.radosgw-admin user info --uid spark >/dev/null 2>&1; then
+        ACCESS=$(sudo microceph.radosgw-admin user info --uid spark | jq -r '.keys[0].access_key')
+        SECRET=$(sudo microceph.radosgw-admin user info --uid spark | jq -r '.keys[0].secret_key')
+        S3="s3cmd --host=$(hostname -I | awk '{print $1}'):80 --host-bucket= --no-ssl --access_key=$ACCESS --secret_key=$SECRET"
+        echo ">>> Removing S3 bucket s3://{{S3_BUCKET}}..."
+        $S3 rb --recursive --force s3://{{S3_BUCKET}} 2>/dev/null || true
+    fi
     rm -f /tmp/airflow-workshop-fernet-uri
     echo ">>> Cleanup complete."
 
@@ -163,14 +168,6 @@ terraform-apply:
       -var="s3_credentials_secret=$S3_URI" \
       -var="s3_endpoint=$S3_ENDPOINT"
 
-# Refresh the executor with the locally-built charm (Spark RBAC fix).
-# Temporary bridge until the RBAC fix lands in a released airflow-kubernetes-executor-k8s.
-refresh-executor:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo ">>> Refreshing airflow-kubernetes-executor with local charm..."
-    juju refresh airflow-kubernetes-executor -m {{MODEL}} --path "{{EXECUTOR_CHARM}}"
-
 # Grant the fernet-key and s3-creds secrets to their apps after Terraform deploys them
 grant-secrets:
     #!/usr/bin/env bash
@@ -203,15 +200,13 @@ wait-ready:
 # DEMO OPERATIONS
 # ============================================================================
 
-# Port-forward the Airflow web UI to http://localhost:8080
-ui-airflow:
-    @echo "Airflow UI: http://localhost:8080  (login: just get-api-server-creds)"
-    kubectl port-forward -n {{MODEL}} svc/airflow-api-server 8080:8080
+# Print the Airflow web UI address (pod IP:8080)
+get-ui-ip:
+    @echo "Airflow UI: http://$(kubectl get pod airflow-api-server-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):8080  (login: just get-api-server-creds)"
 
-# Port-forward the Spark History Server UI to http://localhost:18080
-ui-history:
-    @echo "Spark History Server: http://localhost:18080"
-    kubectl port-forward -n {{MODEL}} svc/spark-history-server-k8s 18080:18080
+# Print the Spark History Server UI address (pod IP:18080)
+get-spark-ui-ip:
+    @echo "Spark History Server: http://$(kubectl get pod spark-history-server-k8s-0 -n {{MODEL}} -o jsonpath='{.status.podIP}'):18080"
 
 # Print the Airflow API server admin credentials
 get-api-server-creds:
