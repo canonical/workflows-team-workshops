@@ -42,7 +42,7 @@ module "git_integrator" {
   channel    = "1.0/edge"
   config = {
     repository_url = "https://github.com/canonical/workflows-team-workshops"
-    tracking_ref   = "feature/airflow-spark"
+    tracking_ref   = "main"
     path           = "./airflow/airflow-spark/dags/"
   }
 }
