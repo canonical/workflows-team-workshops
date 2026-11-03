@@ -3,16 +3,16 @@
 # Deploys Charmed Temporal using the charmed-temporal-solutions Terraform module,
 # then runs a documentation assistant on top of it:
 #   - app/src/agent_worker.py  Temporal worker: DocsQaWorkflow plus an activity that
-#                              fetches docs pages and calls the OpenAI Agents SDK
+#                              fetches docs pages and asks an LLM via OpenRouter
 #   - app/src/chat_ui.py       Chat page that starts one workflow per question
 #
 # Prerequisites: juju bootstrapped on k8s, kubectl, terraform, just, jq, uv,
-#                and an OpenAI API key
+#                and an OpenRouter API key
 #
 # Usage:
 #   just deploy     # Deploy Charmed Temporal and create the namespace (~15 min)
 #   just forward    # Terminal 1: forward the Temporal frontend to localhost:7233
-#   just worker     # Terminal 2: run the worker (needs OPENAI_API_KEY)
+#   just worker     # Terminal 2: run the worker (needs LLM_API_KEY)
 #   just chat       # Terminal 3: run the chat page on http://localhost:8080
 #   just ui         # Optional:   Temporal UI on http://localhost:8088
 #   just teardown   # Destroy everything
@@ -93,12 +93,12 @@ create-namespace:
 forward:
     kubectl -n {{MODEL}} port-forward svc/temporal-frontend 7233:7233
 
-# Run the Temporal worker that answers questions (needs OPENAI_API_KEY)
+# Run the Temporal worker that answers questions (needs LLM_API_KEY)
 worker:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-        echo "OPENAI_API_KEY is not set. See 'Set your OpenAI API key' in README.md."
+    if [[ -z "${LLM_API_KEY:-}" ]]; then
+        echo "LLM_API_KEY is not set. See 'Set your LLM API key' in README.md."
         exit 1
     fi
     cd app

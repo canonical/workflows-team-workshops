@@ -1,4 +1,7 @@
-"""Temporal worker that runs an OpenAI Agents SDK-backed documentation assistant."""
+"""Temporal worker that runs a documentation assistant built on the OpenAI Agents SDK.
+
+The LLM is reached through any OpenAI-compatible API, OpenRouter by default.
+"""
 
 import asyncio
 import datetime
@@ -9,14 +12,16 @@ from dataclasses import dataclass
 
 from temporalio import activity, workflow
 from temporalio.client import Client, WorkflowHandle
+from temporalio.exceptions import ApplicationError
 from temporalio.worker import Worker
 
 # The workflow sandbox re-imports this module to validate DocsQaWorkflow.
 # These libraries are only used by the activity, so skip sandboxing them.
 with workflow.unsafe.imports_passed_through():
     import httpx
-    from agents import Agent, Runner
+    from agents import Agent, OpenAIChatCompletionsModel, Runner, set_tracing_disabled
     from bs4 import BeautifulSoup
+    from openai import APIStatusError, AsyncOpenAI
 
 DEFAULT_DOC_URLS = [
     "https://docs.temporal.io/",
@@ -24,8 +29,29 @@ DEFAULT_DOC_URLS = [
     "https://charmhub.io/temporal-worker-k8s",
 ]
 
+DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_LLM_MODEL = "openai/gpt-4.1-mini"
+
+_MODEL_NAME_HINT = (
+    "Check LLM_MODEL: OpenRouter model names include the provider (openai/gpt-4.1-mini), "
+    "OpenAI's own API does not (gpt-4.1-mini)."
+)
+
+# LLM API errors that retrying will not fix. Anything else, such as rate limits (429)
+# or provider outages (5xx), is left to Temporal's automatic retries.
+NON_RETRYABLE_LLM_ERRORS = {
+    400: f"The LLM API rejected the request. {_MODEL_NAME_HINT}",
+    401: "The LLM API rejected the key. Check LLM_API_KEY.",
+    402: "The LLM account has run out of credit.",
+    403: "The LLM API refused access with this key or model.",
+    404: f"The LLM API does not know this model. {_MODEL_NAME_HINT}",
+}
+
 # url -> (fetched_at, page text). Kept in the worker process between activity runs.
 _docs_cache: dict[str, tuple[float, str]] = {}
+
+# Set by configure_llm() when the worker starts.
+_llm_client: AsyncOpenAI | None = None
 
 
 @dataclass
@@ -36,14 +62,19 @@ class AskDocsInput:
 
 @activity.defn
 async def answer_docs_question(payload: AskDocsInput) -> str:
-    model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+    if _llm_client is None:
+        raise ApplicationError("The LLM client is not configured.", non_retryable=True)
+
+    model_name = os.environ.get("LLM_MODEL") or DEFAULT_LLM_MODEL
     max_chars = int(os.environ.get("DOCS_MAX_CHARS", "12000"))
 
     docs_context = await _collect_docs_context(payload.doc_urls, max_chars=max_chars)
 
     assistant = Agent(
         name="Charmed Temporal docs assistant",
-        model=model,
+        # A model object sends the name as-is. A plain string would be parsed by the SDK,
+        # which strips or rejects provider prefixes such as "openai/" or "anthropic/".
+        model=OpenAIChatCompletionsModel(model=model_name, openai_client=_llm_client),
         instructions=(
             "You answer questions about Temporal workflows and Charmed Temporal deployments. "
             "Use only the provided documentation context. "
@@ -58,7 +89,14 @@ async def answer_docs_question(payload: AskDocsInput) -> str:
         "Return concise and practical guidance."
     )
 
-    result = await Runner.run(assistant, input=prompt)
+    try:
+        result = await Runner.run(assistant, input=prompt)
+    except APIStatusError as exc:
+        hint = NON_RETRYABLE_LLM_ERRORS.get(exc.status_code)
+        if hint is None:
+            raise
+        raise ApplicationError(f"{hint} (HTTP {exc.status_code})", non_retryable=True) from exc
+
     return str(result.final_output)
 
 
@@ -112,9 +150,28 @@ async def connect_client() -> Client:
     return await Client.connect(target_host, namespace=namespace)
 
 
+def configure_llm() -> None:
+    """Create the client for the OpenAI-compatible LLM API, OpenRouter by default."""
+    global _llm_client  # noqa: PLW0603
+
+    api_key = os.environ.get("LLM_API_KEY")
+    if not api_key:
+        raise SystemExit("LLM_API_KEY is not set. See 'Set your LLM API key' in README.md.")
+
+    _llm_client = AsyncOpenAI(
+        base_url=os.environ.get("LLM_BASE_URL") or DEFAULT_LLM_BASE_URL,
+        api_key=api_key,
+        # OpenRouter shows this name in its usage dashboard.
+        default_headers={"X-Title": "Charmed Temporal docs assistant"},
+    )
+    # The SDK would otherwise upload every run to OpenAI. Temporal already records each step.
+    set_tracing_disabled(True)
+
+
 async def run_worker() -> None:
     task_queue = os.environ.get("TEMPORAL_TASK_QUEUE", "ai-docs-queue")
 
+    configure_llm()
     client = await connect_client()
 
     worker = Worker(

@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ApplicationError
 
 from .agent_worker import connect_client, start_docs_qa
 
@@ -41,6 +42,13 @@ async def _get_client() -> Client:
         if _client is None:
             _client = await connect_client()
         return _client
+
+
+def _root_cause(exc: BaseException) -> str:
+    """Return the activity's own error message, skipping Temporal's wrapper errors."""
+    while not isinstance(exc, ApplicationError) and getattr(exc, "cause", None) is not None:
+        exc = exc.cause
+    return getattr(exc, "message", None) or str(exc)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -81,7 +89,7 @@ async def ask(request: AskRequest) -> AskResponse:
     try:
         answer = await handle.result()
     except WorkflowFailureError as exc:
-        detail = {"message": f"The workflow failed: {exc.cause or exc}", **failure}
+        detail = {"message": f"The workflow failed: {_root_cause(exc)}", **failure}
         raise HTTPException(status_code=502, detail=detail) from exc
     except Exception as exc:  # noqa: BLE001
         detail = {"message": str(exc), **failure}
