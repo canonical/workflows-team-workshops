@@ -2,8 +2,8 @@
 #
 # Deploys Charmed Temporal using the charmed-temporal-solutions Terraform module,
 # then runs a documentation assistant on top of it:
-#   - app/src/agent_worker.py  Temporal worker: DocsQaWorkflow plus an activity that
-#                              fetches docs pages and asks an LLM via OpenRouter
+#   - app/src/agent_worker.py  Temporal worker: DocsQaWorkflow runs an AI agent that
+#                              looks answers up in the docs and asks an LLM via OpenRouter
 #   - app/src/chat_ui.py       Chat page that starts one workflow per question
 #
 # Prerequisites: juju bootstrapped on k8s, kubectl, terraform, just, jq, uv,

@@ -369,7 +369,6 @@
             </svg>
           </button>
         </form>
-        <p class="note">Each question is answered on its own. Earlier ones are not remembered.</p>
       </div>
     </footer>
 
@@ -495,6 +494,10 @@
         scroller.scrollTop = scroller.scrollHeight;
       }
 
+      function isNearEnd() {
+        return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+      }
+
       function addUserMessage(question) {
         thread.append(element("div", "message user", question));
         scrollToEnd();
@@ -512,11 +515,16 @@
         scrollToEnd();
 
         const startedAt = performance.now();
+        let label = "Running workflow…";
+        // Set once the workflow reports progress, so the hint below only appears when nothing is happening.
         let hinted = false;
+        const seconds = () => Math.round((performance.now() - startedAt) / 1000);
+        const render = () => {
+          status.textContent = label + " " + seconds() + " s";
+        };
         const timer = setInterval(() => {
-          const seconds = Math.round((performance.now() - startedAt) / 1000);
-          status.textContent = "Running workflow… " + seconds + " s";
-          if (!hinted && seconds >= SLOW_AFTER_SECONDS) {
+          render();
+          if (!hinted && seconds() >= SLOW_AFTER_SECONDS) {
             hinted = true;
             bubble.append(element("div", "hint", "This is taking longer than usual. Check that the worker is running."));
             scrollToEnd();
@@ -525,6 +533,11 @@
 
         return {
           bubble,
+          setStatus(text) {
+            hinted = true;
+            label = text + "…";
+            render();
+          },
           stop() {
             clearInterval(timer);
             bubble.replaceChildren();
@@ -532,18 +545,30 @@
         };
       }
 
+      // Replaces the waiting dots with the answer so far. Called again as more text arrives.
+      function showText(pending, text) {
+        if (!text) return;
+        const follow = isNearEnd();
+        if (!pending.body) {
+          pending.stop();
+          pending.body = element("div", "body");
+          pending.bubble.append(pending.body);
+        }
+        pending.body.innerHTML = renderMarkdown(text);
+        if (follow) scrollToEnd();
+      }
+
       function showAnswer(pending, payload) {
-        pending.stop();
-        const body = element("div", "body");
-        body.innerHTML = renderMarkdown(payload.answer || "");
+        showText(pending, payload.answer || " ");
         const meta = element("div", "meta");
         meta.append(Number(payload.duration_seconds || 0).toFixed(1) + " s");
-        pending.bubble.append(body, meta);
+        pending.bubble.append(meta);
         scrollToEnd();
       }
 
       function showError(pending, error, question) {
         pending.stop();
+        pending.body = null;
         pending.bubble.classList.add("error");
         pending.bubble.setAttribute("role", "alert");
         pending.bubble.append(element("div", "body", error.message));
@@ -572,6 +597,22 @@
         return new Error(message);
       }
 
+      // Reads the newline-delimited JSON events sent by /ask/stream.
+      async function* readEvents(response) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffered = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffered += decoder.decode(value, { stream: true });
+          const lines = buffered.split("\n");
+          buffered = lines.pop();
+          for (const line of lines) if (line.trim()) yield JSON.parse(line);
+        }
+        if (buffered.trim()) yield JSON.parse(buffered);
+      }
+
       function setBusy(value) {
         busy = value;
         send.disabled = value || !input.value.trim();
@@ -583,7 +624,7 @@
         try {
           let response;
           try {
-            response = await fetch("/ask", {
+            response = await fetch("/ask/stream", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ question }),
@@ -592,14 +633,34 @@
             throw new Error("Could not reach the chat server. Check that it is still running.");
           }
 
-          let payload = null;
-          try {
-            payload = await response.json();
-          } catch {
-            // Non-JSON error body; fall through with payload = null.
+          if (!response.ok) {
+            let payload = null;
+            try {
+              payload = await response.json();
+            } catch {
+              // Non-JSON error body; fall through with payload = null.
+            }
+            throw errorFromResponse(response.status, payload);
           }
-          if (!response.ok || !payload) throw errorFromResponse(response.status, payload);
-          showAnswer(pending, payload);
+
+          let finished = false;
+          try {
+            for await (const event of readEvents(response)) {
+              if (event.type === "status" && !pending.body) pending.setStatus(event.text);
+              else if (event.type === "partial") showText(pending, event.text);
+              else if (event.type === "error") throw new Error(event.message);
+              else if (event.type === "done") {
+                showAnswer(pending, event);
+                finished = true;
+              }
+            }
+          } catch (error) {
+            if (error instanceof SyntaxError || error instanceof TypeError) {
+              throw new Error("The connection to the chat server was lost. Check that it is still running.");
+            }
+            throw error;
+          }
+          if (!finished) throw new Error("The connection to the chat server was lost. Check that it is still running.");
         } catch (error) {
           showError(pending, error, question);
         } finally {
