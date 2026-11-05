@@ -67,18 +67,16 @@ wait-ready:
     set -euo pipefail
     echo ">>> Waiting for all units to become active (up to 60 min)..."
     echo "    Temporal units may show 'error' briefly while the schema is created; they recover."
-    timeout=3600; elapsed=0; interval=15
-    while [ $elapsed -lt $timeout ]; do
-        if juju wait-for model {{MODEL}} \
-          --query='forEach(applications, app => app.status == "active")' \
-          --timeout=${interval}s 2>/dev/null; then
-            echo ">>> All units active!"
-            exit 0
-        fi
-        elapsed=$((elapsed + interval))
-    done
-    echo "Timed out — check: juju status -m {{MODEL}}"
-    exit 1
+    # Jubilant polls juju status, so this works on Juju 3.6 and 4 (Juju 4 removed juju wait-for).
+    if uv run --quiet --no-project --with 'jubilant>=1.11,<2' python -c '
+    import jubilant
+    jubilant.Juju(model="{{MODEL}}").wait(jubilant.all_active, delay=5, timeout=3600)
+    '; then
+        echo ">>> All units active!"
+    else
+        echo "Timed out: check: juju status -m {{MODEL}}"
+        exit 1
+    fi
 
 # Create the Temporal namespace the assistant runs its workflows in
 create-namespace:

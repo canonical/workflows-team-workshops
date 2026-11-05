@@ -131,7 +131,7 @@ Start with the suggested questions on the chat page, then try these:
    within 30 seconds Temporal retries it on the new worker. The answer then
    starts again from the beginning in the chat page.
 
-The workflow has a 120-second limit, so restart the worker promptly.
+The workflow has a 3-minute limit, so restart the worker promptly.
 
 ### 4. See a failure that is not retried
 
