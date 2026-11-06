@@ -11,7 +11,10 @@ OpenAI, Anthropic, Google and others with one key.
 It follows the patterns in the [Temporal AI Cookbook](https://docs.temporal.io/ai-cookbook)
 and uses Temporal's [OpenAI Agents SDK integration](https://github.com/temporalio/sdk-python/tree/main/temporalio/contrib/openai_agents):
 every LLM call and every tool call is its own activity, so Temporal retries each
-one separately and records every step.
+one separately and records every step. Each step's input and output is kept in
+the workflow's Event History: the prompts and tool results sent to the LLM, and
+what it answered. You can see in the Temporal UI exactly why the assistant gave
+an answer (exercise 2).
 
 Estimated duration: about 45 minutes (15 minutes of deployment, then the exercises).
 
@@ -118,7 +121,17 @@ Start with the suggested questions on the chat page, then try these:
    - an `invoke_model_activity_streaming` activity for each LLM call;
    - an activity for each tool the agent chose, such as `search_temporal_docs`;
    - the answer as the result.
-4. The `__temporal_workflow_stream_publish` signals in the history carry the
+4. Click an activity to see its input and result. This is the full context the
+   model worked with:
+   - an `invoke_model_activity_streaming` input holds the instructions, the
+     question and every tool result sent to the LLM, and its result holds the
+     model's response, including the tool calls it chose;
+   - a tool activity shows the arguments the model chose, such as the search
+     query, and the docs text it returned.
+
+   Use this to debug a wrong answer: check whether the right pages were found,
+   and what the model was given when it wrote the answer.
+5. The `__temporal_workflow_stream_publish` signals in the history carry the
    answer to the chat page while it is written (see [How It Works](#how-it-works)).
 
 ### 3. See durable execution
