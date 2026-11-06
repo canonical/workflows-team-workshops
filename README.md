@@ -29,7 +29,7 @@ workshops/
 
 | Workshop | Project | Description |
 |----------|---------|-------------|
-| _Coming soon_ | | |
+| [AI docs assistant](temporal/ai-docs-assistant/) | Charmed Temporal | A documentation chatbot whose answers run as Temporal workflows |
 
 ## Contributing
 

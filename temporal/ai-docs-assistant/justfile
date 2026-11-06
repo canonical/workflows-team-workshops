@@ -1,0 +1,132 @@
+# Charmed Temporal AI Docs Assistant Workshop
+#
+# Deploys Charmed Temporal using the charmed-temporal-solutions Terraform module,
+# then runs a documentation assistant on top of it:
+#   - app/src/agent_worker.py  Temporal worker: DocsQaWorkflow runs an AI agent that
+#                              looks answers up in the docs and asks an LLM via OpenRouter
+#   - app/src/chat_ui.py       Chat page that starts one workflow per question
+#
+# Prerequisites: juju bootstrapped on k8s, kubectl, terraform, just, jq, uv,
+#                and an OpenRouter API key
+#
+# Usage:
+#   just deploy     # Deploy Charmed Temporal and create the namespace (~15 min)
+#   just forward    # Terminal 1: forward the Temporal frontend to localhost:7233
+#   just worker     # Terminal 2: run the worker (needs LLM_API_KEY)
+#   just chat       # Terminal 3: run the chat page on http://localhost:8080
+#   just ui         # Optional:   Temporal UI on http://localhost:8088
+#   just teardown   # Destroy everything
+
+# Juju model = Kubernetes namespace for the Temporal charm Pods
+MODEL      := "temporal-workshop"
+# Temporal namespace and task queue used by the assistant
+NAMESPACE  := "ai-assistant"
+TASK_QUEUE := "ai-docs-queue"
+RETENTION  := "3d"
+CHAT_PORT  := "8080"
+UI_PORT    := "8088"
+
+export TEMPORAL_HOST       := env("TEMPORAL_HOST", "localhost:7233")
+export TEMPORAL_NAMESPACE  := NAMESPACE
+export TEMPORAL_TASK_QUEUE := TASK_QUEUE
+
+# Default: list all recipes
+default:
+    @just --list
+
+# Full deployment from scratch
+deploy: create-model terraform-apply wait-ready create-namespace
+    @echo "======================================================================"
+    @echo "  DEPLOYMENT COMPLETE — Model: {{MODEL}}, Temporal namespace: {{NAMESPACE}}"
+    @echo "  Next, in three terminals: just forward  |  just worker  |  just chat"
+    @echo "======================================================================"
+
+# ============================================================================
+# DEPLOYMENT
+# ============================================================================
+
+# Create a fresh Juju model
+create-model:
+    juju add-model {{MODEL}}
+    # Retry failed hooks automatically; works around canonical/temporal-k8s-operator#133
+    juju model-config -m {{MODEL}} automatically-retry-hooks=true
+
+# Deploy Charmed Temporal via Terraform
+terraform-apply:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    MODEL_UUID=$(juju show-model {{MODEL}} --format=json | jq -r '."{{MODEL}}"["model-uuid"]')
+    echo "    Model UUID: $MODEL_UUID"
+    cd terraform
+    [[ -d .terraform ]] || terraform init
+    terraform apply -auto-approve -var="model_uuid=$MODEL_UUID"
+
+# Wait for all applications to become active
+wait-ready:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo ">>> Waiting for all units to become active (up to 60 min)..."
+    echo "    Temporal units may show 'error' briefly while the schema is created; they recover."
+    # Jubilant polls juju status, so this works on Juju 3.6 and 4 (Juju 4 removed juju wait-for).
+    if uv run --quiet --no-project --with 'jubilant>=1.11,<2' python -c '
+    import jubilant
+    jubilant.Juju(model="{{MODEL}}").wait(jubilant.all_active, delay=5, timeout=3600)
+    '; then
+        echo ">>> All units active!"
+    else
+        echo "Timed out: check: juju status -m {{MODEL}}"
+        exit 1
+    fi
+
+# Create the Temporal namespace the assistant runs its workflows in
+create-namespace:
+    juju run -m {{MODEL}} temporal-admin/leader cli \
+      args="operator namespace create --namespace {{NAMESPACE}} --retention {{RETENTION}}" --wait=2m
+
+# ============================================================================
+# DEMO OPERATIONS
+# ============================================================================
+
+# Forward the Temporal frontend to localhost:7233 (keep running)
+forward:
+    kubectl -n {{MODEL}} port-forward svc/temporal-frontend 7233:7233
+
+# Run the Temporal worker that answers questions (needs LLM_API_KEY)
+worker:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ -z "${LLM_API_KEY:-}" ]]; then
+        echo "LLM_API_KEY is not set. See 'Set your LLM API key' in README.md."
+        exit 1
+    fi
+    cd app
+    uv sync --quiet
+    exec uv run python -m src.agent_worker
+
+# Run the chat page on http://localhost:8080
+chat:
+    cd app && TEMPORAL_UI_URL=http://localhost:{{UI_PORT}} \
+      uv run uvicorn src.chat_ui:app --host 127.0.0.1 --port {{CHAT_PORT}}
+
+# Forward the Temporal UI to http://localhost:8088 (keep running)
+ui:
+    kubectl -n {{MODEL}} port-forward pod/temporal-ui-0 {{UI_PORT}}:8080
+
+# Show the Juju status of the deployment
+status:
+    juju status -m {{MODEL}}
+
+# Destroy the deployment, the Juju model and the Terraform state
+teardown:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [[ -f terraform/terraform.tfstate ]]; then
+        MODEL_UUID=$(juju show-model {{MODEL}} --format=json 2>/dev/null \
+          | jq -r '."{{MODEL}}"["model-uuid"]' 2>/dev/null || echo "")
+        if [[ -n "$MODEL_UUID" ]]; then
+            (cd terraform && terraform destroy -auto-approve -var="model_uuid=$MODEL_UUID") || true
+        fi
+    fi
+    rm -f terraform/terraform.tfstate terraform/terraform.tfstate.backup
+    juju destroy-model --no-prompt --destroy-storage {{MODEL}} --force 2>/dev/null || true
+    echo ">>> Teardown complete."
