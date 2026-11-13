@@ -1,0 +1,732 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Charmed Temporal Docs Assistant</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --bar: rgba(255, 255, 255, 0.8);
+        --ink: #1d1d1f;
+        --muted: #6e6e73;
+        --line: #d2d2d7;
+        --soft: #f5f5f7;
+        --accent: #e95420;
+        --error: #b3261e;
+        --error-bg: #fdf0ef;
+        --shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #000000;
+          --bar: rgba(0, 0, 0, 0.72);
+          --ink: #f5f5f7;
+          --muted: #98989d;
+          --line: #38383a;
+          --soft: #1c1c1e;
+          --error: #ff8a80;
+          --error-bg: #2a1513;
+          --shadow: none;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        display: flex;
+        flex-direction: column;
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Inter, "Segoe UI", sans-serif;
+        font-size: 17px;
+        line-height: 1.47;
+        letter-spacing: -0.01em;
+        background: var(--bg);
+        color: var(--ink);
+        -webkit-font-smoothing: antialiased;
+      }
+      .column {
+        width: 100%;
+        max-width: 720px;
+        margin: 0 auto;
+        padding: 0 20px;
+      }
+      header {
+        background: var(--bar);
+        -webkit-backdrop-filter: saturate(180%) blur(20px);
+        backdrop-filter: saturate(180%) blur(20px);
+        border-bottom: 1px solid var(--line);
+      }
+      header .column {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 48px;
+      }
+      h1 {
+        margin: 0;
+        font-size: 0.875rem;
+        font-weight: 600;
+      }
+      h1::before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-right: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+      .header-meta {
+        font-size: 0.75rem;
+      }
+      a {
+        color: inherit;
+        text-decoration: underline;
+        text-decoration-color: var(--accent);
+        text-decoration-thickness: 1.5px;
+        text-underline-offset: 3px;
+      }
+      a:hover {
+        text-decoration-thickness: 2.5px;
+      }
+      #messages {
+        flex: 1;
+        overflow-y: auto;
+      }
+      #messages .column {
+        display: flex;
+        flex-direction: column;
+        gap: 28px;
+        min-height: 100%;
+        padding-top: 32px;
+        padding-bottom: 32px;
+      }
+      .empty {
+        margin: auto 0;
+        text-align: center;
+      }
+      .empty h2 {
+        margin: 0 0 8px;
+        font-size: clamp(1.75rem, 5vw, 2.5rem);
+        font-weight: 600;
+        line-height: 1.1;
+        letter-spacing: -0.02em;
+      }
+      .empty p {
+        margin: 0 0 32px;
+        color: var(--muted);
+      }
+      .suggestions {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+      }
+      .suggestions button {
+        padding: 8px 16px;
+        font: inherit;
+        font-size: 0.875rem;
+        color: var(--ink);
+        background: none;
+        border: 1px solid var(--line);
+        border-radius: 980px;
+        cursor: pointer;
+        transition: background-color 0.15s;
+      }
+      .suggestions button:hover {
+        background: var(--soft);
+      }
+      .message {
+        max-width: 100%;
+        overflow-wrap: anywhere;
+      }
+      .message.user {
+        align-self: flex-end;
+        max-width: 80%;
+        padding: 10px 18px;
+        white-space: pre-wrap;
+        background: var(--soft);
+        border-radius: 22px;
+      }
+      .message.assistant {
+        align-self: stretch;
+      }
+      .message.error {
+        padding: 14px 18px;
+        background: var(--error-bg);
+        color: var(--error);
+        border-radius: 16px;
+      }
+      .body > :first-child {
+        margin-top: 0;
+      }
+      .body > :last-child {
+        margin-bottom: 0;
+      }
+      .body p,
+      .body ul,
+      .body ol,
+      .body pre {
+        margin: 0 0 14px;
+      }
+      .body h3 {
+        margin: 22px 0 8px;
+        font-size: 1.0625rem;
+        font-weight: 600;
+      }
+      .body ul,
+      .body ol {
+        padding-left: 24px;
+      }
+      .body li + li {
+        margin-top: 4px;
+      }
+      .body code {
+        padding: 2px 6px;
+        font-family: "SF Mono", ui-monospace, Menlo, "DejaVu Sans Mono", monospace;
+        font-size: 0.85em;
+        letter-spacing: 0;
+        background: var(--soft);
+        border-radius: 6px;
+      }
+      .body pre {
+        padding: 14px 16px;
+        overflow-x: auto;
+        background: var(--soft);
+        border-radius: 12px;
+      }
+      .body pre code {
+        padding: 0;
+        background: none;
+      }
+      .meta {
+        margin-top: 10px;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      .message.error .meta {
+        color: inherit;
+      }
+      .meta button {
+        padding: 5px 14px;
+        font: inherit;
+        color: inherit;
+        background: none;
+        border: 1px solid currentColor;
+        border-radius: 980px;
+        cursor: pointer;
+      }
+      .pending {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 0.875rem;
+        color: var(--muted);
+      }
+      .dots {
+        display: inline-flex;
+        gap: 4px;
+      }
+      .dots i {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        animation: pulse 1.2s infinite ease-in-out;
+      }
+      .dots i:nth-child(2) {
+        animation-delay: 0.2s;
+      }
+      .dots i:nth-child(3) {
+        animation-delay: 0.4s;
+      }
+      @keyframes pulse {
+        0%,
+        80%,
+        100% {
+          opacity: 0.25;
+        }
+        40% {
+          opacity: 1;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .dots i {
+          animation: none;
+          opacity: 0.6;
+        }
+      }
+      .hint {
+        margin-top: 8px;
+        font-size: 0.75rem;
+        color: var(--muted);
+      }
+      footer .column {
+        padding-top: 8px;
+        padding-bottom: 14px;
+      }
+      #composer {
+        display: flex;
+        align-items: flex-end;
+        gap: 8px;
+        padding: 6px 6px 6px 18px;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 26px;
+        box-shadow: var(--shadow);
+        transition: border-color 0.15s;
+      }
+      #composer:focus-within {
+        border-color: var(--accent);
+      }
+      #question {
+        flex: 1;
+        min-height: 36px;
+        max-height: 160px;
+        padding: 6px 0;
+        font: inherit;
+        color: var(--ink);
+        background: none;
+        border: 0;
+        outline: none;
+        resize: none;
+      }
+      #question::placeholder {
+        color: var(--muted);
+      }
+      #send {
+        display: grid;
+        place-items: center;
+        flex: none;
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        color: #ffffff;
+        background: var(--accent);
+        border: 0;
+        border-radius: 50%;
+        cursor: pointer;
+        transition: opacity 0.15s;
+      }
+      #send:disabled {
+        opacity: 0.3;
+        cursor: default;
+      }
+      button:focus-visible,
+      a:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+      }
+      .note {
+        margin: 10px 0 0;
+        font-size: 0.75rem;
+        text-align: center;
+        color: var(--muted);
+      }
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="column">
+        <h1>Charmed Temporal Docs Assistant</h1>
+        <span class="header-meta" id="header-meta"></span>
+      </div>
+    </header>
+
+    <main id="messages" aria-live="polite">
+      <div class="column" id="thread">
+        <section class="empty" id="empty">
+          <h2>Ask about Charmed Temporal.</h2>
+          <p>Answers come from the documentation, through a Temporal workflow.</p>
+          <div class="suggestions" id="suggestions"></div>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <div class="column">
+        <form id="composer">
+          <label class="visually-hidden" for="question">Your question</label>
+          <textarea id="question" rows="1" placeholder="Ask a question" autofocus></textarea>
+          <button id="send" type="submit" aria-label="Ask" disabled>
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </form>
+      </div>
+    </footer>
+
+    <script>
+      const SUGGESTIONS = [
+        "What is Temporal and what problem does it solve?",
+        "What does the temporal-worker-k8s charm do?",
+        "Which charms make up a Charmed Temporal deployment?",
+        "What is the difference between a Workflow and an Activity?",
+      ];
+      const SLOW_AFTER_SECONDS = 15;
+
+      const thread = document.getElementById("thread");
+      const scroller = document.getElementById("messages");
+      const empty = document.getElementById("empty");
+      const form = document.getElementById("composer");
+      const input = document.getElementById("question");
+      const send = document.getElementById("send");
+
+      let busy = false;
+      let config = { namespace: "", temporal_ui_url: "" };
+
+      // --- Markdown rendering -------------------------------------------------
+      // Everything is HTML-escaped first, so only the tags added here reach the page.
+
+      function escapeHtml(text) {
+        return text
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function anchor(url, label) {
+        return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + label + "</a>";
+      }
+
+      function renderInline(escaped) {
+        const held = [];
+        const hold = (html) => "\u0000" + (held.push(html) - 1) + "\u0000";
+
+        let out = escaped.replace(/`([^`\n]+)`/g, (_, code) => hold("<code>" + code + "</code>"));
+        out = out.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => hold(anchor(url, label)));
+        out = out.replace(/https?:\/\/(?:(?!&(?:quot|lt|gt);)\S)+/g, (match) => {
+          const url = match.replace(/[.,;:!?)\]']+$/, "");
+          return hold(anchor(url, url)) + match.slice(url.length);
+        });
+        out = out.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+        return out.replace(/\u0000(\d+)\u0000/g, (_, index) => held[Number(index)]);
+      }
+
+      function renderMarkdown(text) {
+        const lines = escapeHtml(text.replace(/\r\n?/g, "\n")).split("\n");
+        const html = [];
+        let paragraph = [];
+        let list = null;
+
+        const flushParagraph = () => {
+          if (paragraph.length) html.push("<p>" + paragraph.map(renderInline).join("<br>") + "</p>");
+          paragraph = [];
+        };
+        const flushList = () => {
+          if (list) html.push("<" + list.tag + ">" + list.items.map((item) => "<li>" + renderInline(item) + "</li>").join("") + "</" + list.tag + ">");
+          list = null;
+        };
+        const flush = () => {
+          flushParagraph();
+          flushList();
+        };
+
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+
+          if (/^\s*```/.test(line)) {
+            flush();
+            const code = [];
+            for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+            html.push("<pre><code>" + code.join("\n") + "</code></pre>");
+            continue;
+          }
+
+          const heading = line.match(/^\s*#{1,6}\s+(.*)$/);
+          if (heading) {
+            flush();
+            html.push("<h3>" + renderInline(heading[1]) + "</h3>");
+            continue;
+          }
+
+          const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+          const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+          if (bullet || numbered) {
+            flushParagraph();
+            const tag = bullet ? "ul" : "ol";
+            if (list && list.tag !== tag) flushList();
+            if (!list) list = { tag, items: [] };
+            list.items.push((bullet || numbered)[1]);
+            continue;
+          }
+
+          if (!line.trim()) {
+            flush();
+            continue;
+          }
+
+          flushList();
+          paragraph.push(line.trim());
+        }
+
+        flush();
+        return html.join("");
+      }
+
+      // --- Thread -------------------------------------------------------------
+
+      function element(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+
+      function scrollToEnd() {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+
+      function isNearEnd() {
+        return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+      }
+
+      function addUserMessage(question) {
+        thread.append(element("div", "message user", question));
+        scrollToEnd();
+      }
+
+      function addPendingMessage() {
+        const bubble = element("div", "message assistant");
+        const row = element("div", "pending");
+        const dots = element("span", "dots");
+        dots.append(element("i"), element("i"), element("i"));
+        const status = element("span", "", "Running workflow…");
+        row.append(dots, status);
+        bubble.append(row);
+        thread.append(bubble);
+        scrollToEnd();
+
+        const startedAt = performance.now();
+        let label = "Running workflow…";
+        // Set once the workflow reports progress, so the hint below only appears when nothing is happening.
+        let hinted = false;
+        const seconds = () => Math.round((performance.now() - startedAt) / 1000);
+        const render = () => {
+          status.textContent = label + " " + seconds() + " s";
+        };
+        const timer = setInterval(() => {
+          render();
+          if (!hinted && seconds() >= SLOW_AFTER_SECONDS) {
+            hinted = true;
+            bubble.append(element("div", "hint", "This is taking longer than usual. Check that the worker is running."));
+            scrollToEnd();
+          }
+        }, 1000);
+
+        return {
+          bubble,
+          setStatus(text) {
+            hinted = true;
+            label = text + "…";
+            render();
+          },
+          stop() {
+            clearInterval(timer);
+            bubble.replaceChildren();
+          },
+        };
+      }
+
+      // Replaces the waiting dots with the answer so far. Called again as more text arrives.
+      function showText(pending, text) {
+        if (!text) return;
+        const follow = isNearEnd();
+        if (!pending.body) {
+          pending.stop();
+          pending.body = element("div", "body");
+          pending.bubble.append(pending.body);
+        }
+        pending.body.innerHTML = renderMarkdown(text);
+        if (follow) scrollToEnd();
+      }
+
+      function showAnswer(pending, payload) {
+        showText(pending, payload.answer || " ");
+        const meta = element("div", "meta");
+        meta.append(Number(payload.duration_seconds || 0).toFixed(1) + " s");
+        pending.bubble.append(meta);
+        scrollToEnd();
+      }
+
+      function showError(pending, error, question) {
+        pending.stop();
+        pending.body = null;
+        pending.bubble.classList.add("error");
+        pending.bubble.setAttribute("role", "alert");
+        pending.bubble.append(element("div", "body", error.message));
+
+        const meta = element("div", "meta");
+        const retry = element("button", "", "Try again");
+        retry.type = "button";
+        retry.addEventListener("click", () => {
+          pending.bubble.remove();
+          run(question);
+        });
+        meta.append(retry);
+        pending.bubble.append(meta);
+        scrollToEnd();
+      }
+
+      // --- Asking -------------------------------------------------------------
+
+      function errorFromResponse(status, payload) {
+        const detail = payload && payload.detail;
+        let message = "The request failed (HTTP " + status + ").";
+        if (typeof detail === "string") message = detail;
+        else if (Array.isArray(detail) && detail[0] && detail[0].msg) message = detail[0].msg;
+        else if (detail && detail.message) message = detail.message;
+
+        return new Error(message);
+      }
+
+      // Reads the newline-delimited JSON events sent by /ask/stream.
+      async function* readEvents(response) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffered = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffered += decoder.decode(value, { stream: true });
+          const lines = buffered.split("\n");
+          buffered = lines.pop();
+          for (const line of lines) if (line.trim()) yield JSON.parse(line);
+        }
+        if (buffered.trim()) yield JSON.parse(buffered);
+      }
+
+      function setBusy(value) {
+        busy = value;
+        send.disabled = value || !input.value.trim();
+      }
+
+      async function run(question) {
+        const pending = addPendingMessage();
+        setBusy(true);
+        try {
+          let response;
+          try {
+            response = await fetch("/ask/stream", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ question }),
+            });
+          } catch {
+            throw new Error("Could not reach the chat server. Check that it is still running.");
+          }
+
+          if (!response.ok) {
+            let payload = null;
+            try {
+              payload = await response.json();
+            } catch {
+              // Non-JSON error body; fall through with payload = null.
+            }
+            throw errorFromResponse(response.status, payload);
+          }
+
+          let finished = false;
+          try {
+            for await (const event of readEvents(response)) {
+              if (event.type === "status" && !pending.body) pending.setStatus(event.text);
+              else if (event.type === "partial") showText(pending, event.text);
+              else if (event.type === "error") throw new Error(event.message);
+              else if (event.type === "done") {
+                showAnswer(pending, event);
+                finished = true;
+              }
+            }
+          } catch (error) {
+            if (error instanceof SyntaxError || error instanceof TypeError) {
+              throw new Error("The connection to the chat server was lost. Check that it is still running.");
+            }
+            throw error;
+          }
+          if (!finished) throw new Error("The connection to the chat server was lost. Check that it is still running.");
+        } catch (error) {
+          showError(pending, error, question);
+        } finally {
+          setBusy(false);
+          input.focus();
+        }
+      }
+
+      function ask(question) {
+        question = question.trim();
+        if (busy || !question) return;
+        empty.remove();
+        addUserMessage(question);
+        run(question);
+      }
+
+      function resizeInput() {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight + 2, 160) + "px";
+      }
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const question = input.value;
+        if (busy || !question.trim()) return;
+        input.value = "";
+        resizeInput();
+        ask(question);
+      });
+
+      input.addEventListener("input", () => {
+        resizeInput();
+        send.disabled = busy || !input.value.trim();
+      });
+
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+
+      for (const suggestion of SUGGESTIONS) {
+        const button = element("button", "", suggestion);
+        button.type = "button";
+        button.addEventListener("click", () => ask(suggestion));
+        document.getElementById("suggestions").append(button);
+      }
+
+      async function loadConfig() {
+        try {
+          const response = await fetch("/config");
+          if (response.ok) config = await response.json();
+        } catch {
+          // The page still works without it; the Temporal UI link is just not shown.
+        }
+
+        if (!config.temporal_ui_url) return;
+        const link = element("a", "", "Open Temporal UI");
+        link.href = config.temporal_ui_url + "/namespaces/" + encodeURIComponent(config.namespace) + "/workflows";
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        document.getElementById("header-meta").append(link);
+      }
+
+      loadConfig();
+    </script>
+  </body>
+</html>

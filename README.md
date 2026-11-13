@@ -29,7 +29,8 @@ workshops/
 
 | Workshop | Project | Description |
 |----------|---------|-------------|
-| _Coming soon_ | | |
+| [Airflow and Spark](airflow/airflow-spark/) | Charmed Apache Airflow, Charmed Apache Spark | Run Apache Spark jobs from an Airflow DAG with the KubernetesExecutor |
+| [AI docs assistant](temporal/ai-docs-assistant/) | Charmed Temporal | A documentation chatbot whose answers run as Temporal workflows |
 
 ## Contributing
 
