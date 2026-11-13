@@ -8,7 +8,7 @@
 # connects to the Temporal frontend through a port-forward.
 
 module "charmed_temporal" {
-  source     = "git::https://github.com/canonical/charmed-temporal-solutions//modules/charmed-temporal?ref=track/1.23"
+  source     = "git::https://github.com/canonical/charmed-temporal-solutions//modules/charmed-temporal?ref=track/1.31"
   model_uuid = var.model_uuid
 
   # Sized for a single-node workshop cluster.

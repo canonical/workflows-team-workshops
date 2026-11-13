@@ -58,7 +58,8 @@ terraform-apply:
     MODEL_UUID=$(juju show-model {{MODEL}} --format=json | jq -r '."{{MODEL}}"["model-uuid"]')
     echo "    Model UUID: $MODEL_UUID"
     cd terraform
-    [[ -d .terraform ]] || terraform init
+    # Runs every time so a changed module source (such as a new track) is downloaded.
+    terraform init -input=false
     terraform apply -auto-approve -var="model_uuid=$MODEL_UUID"
 
 # Wait for all applications to become active
